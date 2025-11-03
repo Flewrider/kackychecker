@@ -3,9 +3,10 @@ GUI module for Kacky Watcher using tkinter.
 Provides split-pane interface with map list (tracking/finished checkboxes) and live/tracked output.
 """
 import logging
+import queue
 import threading
 import time
-from typing import List, Set, Tuple, Optional
+from typing import List, Set, Tuple, Optional, Dict, Any
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext
@@ -43,7 +44,7 @@ class KackyWatcherGUI:
         self.status_file = "map_status.json"
         
         # Map range
-        self.map_range_start = 375
+        self.map_range_start = 376
         self.map_range_end = 450
         
         # Debounce timer for status saving
@@ -55,6 +56,15 @@ class KackyWatcherGUI:
         self.running = False
         self.immediate_fetch_event = threading.Event()  # Signal to trigger immediate fetch
         self.transition_refetch_timers: dict[int, str] = {}  # Map number -> timer ID for transition refetches
+        
+        # Queue for thread-safe GUI updates (decouple watcher from GUI rendering)
+        self.update_queue: queue.Queue = queue.Queue(maxsize=100)  # Limit queue size
+        self.last_refresh_time: float = 0.0  # Throttle refresh calls
+        self.refresh_throttle_ms: float = 50.0  # Minimum ms between refreshes
+        self.pending_refresh: bool = False  # Flag to indicate refresh is needed
+        self.refresh_timer_id: Optional[str] = None  # ID of pending refresh timer
+        self.is_resizing: bool = False  # Flag to track if window is being resized
+        self.resize_timer_id: Optional[str] = None  # Timer to detect end of resize
         
         # Current state for display
         self.live_maps: List[int] = []
@@ -93,78 +103,151 @@ class KackyWatcherGUI:
         main_paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # Left pane: Map list with checkboxes
-        left_frame = ttk.Frame(main_paned)
+        # Bind resize events to pause refreshes during resize
+        self.root.bind("<Configure>", self._on_resize_start)
+        main_paned.bind("<Configure>", self._on_resize_start)
+        
+        # Left pane: Map list with checkboxes (with border)
+        left_frame = tk.Frame(main_paned, relief=tk.SOLID, borderwidth=1, bg="black")
         main_paned.add(left_frame, weight=1)
         
+        # Inner frame for left pane content
+        left_inner = ttk.Frame(left_frame)
+        left_inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        
         # Header
-        header_frame = ttk.Frame(left_frame)
+        header_frame = ttk.Frame(left_inner)
         header_frame.pack(fill=tk.X, padx=5, pady=(5, 2))
         ttk.Label(header_frame, text="Maps", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
         
         # Column headers - use grid for better alignment
-        header_row = ttk.Frame(left_frame)
-        header_row.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(header_row, text="Map", width=8, font=("Arial", 9, "bold")).grid(row=0, column=0, padx=2)
-        ttk.Label(header_row, text="Tracking", width=10, font=("Arial", 9, "bold")).grid(row=0, column=1, padx=2)
-        ttk.Label(header_row, text="Finished", width=10, font=("Arial", 9, "bold")).grid(row=0, column=2, padx=2)
-        # Configure grid columns to not expand
-        header_row.grid_columnconfigure(0, weight=0)
-        header_row.grid_columnconfigure(1, weight=0)
-        header_row.grid_columnconfigure(2, weight=0)
+        # Calculate padding from left_inner to container's left edge:
+        # map_paned padx=5 + outer_frame border=1 + inner_frame padx=1 + canvas_frame padx=5 = 12px
+        # Container is positioned at x=0 within canvas, which is at the left edge of canvas_frame
+        # So header should be at 12px from left_inner to match container content
+        header_row = ttk.Frame(left_inner)
+        header_row.pack(fill=tk.X, padx=12, pady=2)  # Match container position: 5+1+1+5=12px
         
-        # Scrollable frame for map list
-        canvas_frame = ttk.Frame(left_frame)
-        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # Use fixed column widths that match row widgets exactly
+        # Use padx=(0, 2) to only add right padding, ensuring left alignment
+        # Map column - fixed width frame
+        map_header_frame = ttk.Frame(header_row, width=70)
+        map_header_frame.grid(row=0, column=0, padx=(0, 2), sticky=tk.W)
+        map_header_frame.grid_propagate(False)
+        ttk.Label(map_header_frame, text="Map", width=8, font=("Arial", 9, "bold")).pack(anchor=tk.W)
         
-        canvas = tk.Canvas(canvas_frame, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=canvas.yview)
-        self.map_container = ttk.Frame(canvas)
+        # Tracking column - fixed width frame
+        tracking_header_frame = ttk.Frame(header_row, width=90)
+        tracking_header_frame.grid(row=0, column=1, padx=(0, 2), sticky=tk.W)
+        tracking_header_frame.grid_propagate(False)
+        ttk.Label(tracking_header_frame, text="Tracking", width=10, font=("Arial", 9, "bold")).pack(anchor=tk.W)
         
-        canvas_window = canvas.create_window((0, 0), window=self.map_container, anchor=tk.NW)
+        # Finished column - fixed width frame
+        finished_header_frame = ttk.Frame(header_row, width=90)
+        finished_header_frame.grid(row=0, column=2, padx=(0, 2), sticky=tk.W)
+        finished_header_frame.grid_propagate(False)
+        ttk.Label(finished_header_frame, text="Finished", width=10, font=("Arial", 9, "bold")).pack(anchor=tk.W)
         
-        def configure_scroll_region(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
+        # Configure grid columns with exact widths
+        header_row.grid_columnconfigure(0, weight=0, minsize=70)
+        header_row.grid_columnconfigure(1, weight=0, minsize=90)
+        header_row.grid_columnconfigure(2, weight=0, minsize=90)
         
-        def configure_canvas_width(event):
-            canvas_width = event.width
-            canvas.itemconfig(canvas_window, width=canvas_width)
+        # Create resizable paned window for unfinished and finished sections
+        map_paned = ttk.PanedWindow(left_inner, orient=tk.VERTICAL)
+        map_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        map_paned.bind("<Configure>", self._on_resize_start)
         
-        self.map_container.bind("<Configure>", configure_scroll_region)
-        canvas.bind("<Configure>", configure_canvas_width)
+        # Helper function to create scrollable frame
+        def create_scrollable_frame(parent, label_text=None):
+            """Create a scrollable frame with canvas and scrollbar."""
+            # Outer frame with border
+            outer_frame = tk.Frame(parent, relief=tk.SOLID, borderwidth=1, bg="black")
+            outer_frame.pack(fill=tk.BOTH, expand=True)
+            
+            # Inner frame for content
+            frame = ttk.Frame(outer_frame)
+            frame.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+            
+            # Add consistent vertical spacing for label area (even if no label)
+            # Use consistent padding for both sections
+            label_area = ttk.Frame(frame)
+            label_area.pack(fill=tk.X, padx=5, pady=(5, 2))  # Same padding for both sections
+            if label_text:
+                label = ttk.Label(label_area, text=label_text, font=("Arial", 9, "bold"))
+                label.pack(anchor=tk.W)
+            # If no label, label_area still exists but is empty (provides consistent spacing)
+            
+            # Canvas frame with consistent padding - must match header alignment
+            canvas_frame = ttk.Frame(frame)
+            canvas_frame.pack(fill=tk.BOTH, expand=True, padx=5)  # Same padding as label_area
+            
+            canvas = tk.Canvas(canvas_frame, highlightthickness=0)
+            scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=canvas.yview)
+            # Container with no padding - rows will be added directly
+            container = ttk.Frame(canvas)
+            
+            # Position container at exact same position (x=0) for both sections
+            # Use anchor=tk.NW and x=0 to ensure consistent left alignment
+            canvas_window = canvas.create_window(0, 0, window=container, anchor=tk.NW)
+            
+            def configure_scroll_region(event):
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            
+            def configure_canvas_width(event):
+                canvas_width = event.width
+                # Set container width to match canvas width exactly
+                canvas.itemconfig(canvas_window, width=canvas_width)
+                # Explicitly position container at x=0 to ensure consistent alignment between sections
+                canvas.coords(canvas_window, 0, 0)
+            
+            container.bind("<Configure>", configure_scroll_region)
+            canvas.bind("<Configure>", configure_canvas_width)
+            
+            canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            canvas.configure(yscrollcommand=scrollbar.set)
+            
+            # Mouse wheel scrolling
+            def on_mousewheel(event):
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            
+            def bind_mousewheel(widget):
+                widget.bind("<MouseWheel>", on_mousewheel)
+                for child in widget.winfo_children():
+                    bind_mousewheel(child)
+            
+            canvas.bind("<MouseWheel>", on_mousewheel)
+            canvas_frame.bind("<MouseWheel>", on_mousewheel)
+            container.bind("<MouseWheel>", on_mousewheel)
+            bind_mousewheel(container)
+            
+            return outer_frame, canvas, container
         
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.configure(yscrollcommand=scrollbar.set)
+        # Unfinished maps section (top)
+        unfinished_frame, self.unfinished_canvas, self.unfinished_container = create_scrollable_frame(map_paned)
+        map_paned.add(unfinished_frame, weight=3)  # Give more space to unfinished maps
         
-        # Mouse wheel scrolling (Windows)
-        def on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        # Finished maps section (bottom)
+        finished_frame, self.finished_canvas, self.finished_container = create_scrollable_frame(map_paned, "Finished Maps")
+        map_paned.add(finished_frame, weight=1)  # Less space for finished maps
         
-        # Bind mouse wheel to canvas_frame and all child widgets
-        def bind_mousewheel(widget):
-            widget.bind("<MouseWheel>", on_mousewheel)
-            for child in widget.winfo_children():
-                bind_mousewheel(child)
+        # Store references for backward compatibility
+        self.map_container = self.unfinished_container  # For backward compatibility
+        self.map_canvas = self.unfinished_canvas  # For backward compatibility
         
-        # Bind to canvas_frame and propagate to all children
-        canvas.bind("<MouseWheel>", on_mousewheel)
-        canvas_frame.bind("<MouseWheel>", on_mousewheel)
-        self.map_container.bind("<MouseWheel>", on_mousewheel)
-        # Also bind to all existing and future children
-        bind_mousewheel(self.map_container)
-        
-        # Store canvas reference
-        self.map_canvas = canvas
-        
-        # Right pane: Output display
-        right_frame = ttk.Frame(main_paned)
+        # Right pane: Output display (with border)
+        right_frame = tk.Frame(main_paned, relief=tk.SOLID, borderwidth=1, bg="black")
         main_paned.add(right_frame, weight=1)
         
-        ttk.Label(right_frame, text="Live & Tracked Maps", font=("Arial", 10, "bold")).pack(anchor=tk.W, padx=5, pady=(5, 2))
+        # Inner frame for right pane content
+        right_inner = ttk.Frame(right_frame)
+        right_inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        
+        ttk.Label(right_inner, text="Live & Tracked Maps", font=("Arial", 10, "bold")).pack(anchor=tk.W, padx=5, pady=(5, 2))
         
         self.output_text = scrolledtext.ScrolledText(
-            right_frame,
+            right_inner,
             wrap=tk.WORD,
             font=("Consolas", 10),
             height=30,
@@ -193,7 +276,9 @@ class KackyWatcherGUI:
         try:
             print(f"Populating map list ({self.map_range_start}-{self.map_range_end})...")
             # Clear existing rows but preserve checkbox variable values
-            for widget in self.map_container.winfo_children():
+            for widget in self.unfinished_container.winfo_children():
+                widget.destroy()
+            for widget in self.finished_container.winfo_children():
                 widget.destroy()
             
             self.map_rows.clear()
@@ -233,29 +318,30 @@ class KackyWatcherGUI:
             finished_maps.sort()
             
             print(f"Adding {len(unfinished_maps)} unfinished maps...")
-            # Add unfinished maps first (normal color)
+            # Add unfinished maps to unfinished container
             for i, map_num in enumerate(unfinished_maps):
                 if i % 20 == 0:
                     print(f"  Added {i}/{len(unfinished_maps)} unfinished maps...")
-                self.add_map_row(map_num, map_num in tracking, map_num in finished)
+                self.add_map_row(map_num, map_num in tracking, map_num in finished, container=self.unfinished_container)
             
             print(f"Adding {len(finished_maps)} finished maps...")
-            # Add finished maps at bottom (green background)
+            # Add finished maps to finished container (green background)
             for map_num in finished_maps:
-                self.add_map_row(map_num, map_num in tracking, map_num in finished, is_finished_flag=True)
+                self.add_map_row(map_num, map_num in tracking, map_num in finished, is_finished_flag=True, container=self.finished_container)
             
-            # Rebind mouse wheel to new widgets
-            def bind_mousewheel(widget):
-                widget.bind("<MouseWheel>", lambda e: self.map_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+            # Rebind mouse wheel to new widgets in both containers
+            def bind_mousewheel(widget, target_canvas):
+                widget.bind("<MouseWheel>", lambda e: target_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
                 for child in widget.winfo_children():
-                    bind_mousewheel(child)
-            bind_mousewheel(self.map_container)
+                    bind_mousewheel(child, target_canvas)
+            bind_mousewheel(self.unfinished_container, self.unfinished_canvas)
+            bind_mousewheel(self.finished_container, self.finished_canvas)
             
             print("Map list population complete")
         finally:
             self._populating = False
     
-    def add_map_row(self, map_num: int, is_tracking: bool, is_finished: bool, is_finished_flag: bool = False) -> None:
+    def add_map_row(self, map_num: int, is_tracking: bool, is_finished: bool, is_finished_flag: bool = False, container: Optional[tk.Widget] = None) -> None:
         """
         Add a map row to the list.
         
@@ -264,7 +350,11 @@ class KackyWatcherGUI:
             is_tracking: Whether map is being tracked
             is_finished: Whether map is finished
             is_finished_flag: Whether this is being added as a finished map (for styling)
+            container: Container widget to add the row to (defaults to unfinished_container)
         """
+        # Use specified container or default to unfinished
+        if container is None:
+            container = self.unfinished_container
         # Create checkbox variables if not exists
         if map_num not in self.tracking_vars:
             var = tk.BooleanVar(value=is_tracking)
@@ -284,38 +374,52 @@ class KackyWatcherGUI:
         
         # Use colored frame for finished maps, regular frame for others
         if is_finished_flag or is_finished:
-            row_frame = tk.Frame(self.map_container, bg="#90EE90")  # Light green
+            row_frame = tk.Frame(container, bg="#90EE90")  # Light green
             bg_color = "#90EE90"
         else:
-            row_frame = ttk.Frame(self.map_container)
+            row_frame = ttk.Frame(container)
             bg_color = None
         
         # Use grid layout for consistent alignment regardless of window size
-        row_frame.grid_columnconfigure(0, weight=0)
-        row_frame.grid_columnconfigure(1, weight=0)
-        row_frame.grid_columnconfigure(2, weight=0)
+        # Match column widths exactly with header
+        row_frame.grid_columnconfigure(0, weight=0, minsize=70)  # Match header column 0
+        row_frame.grid_columnconfigure(1, weight=0, minsize=90)  # Match header column 1
+        row_frame.grid_columnconfigure(2, weight=0, minsize=90)  # Match header column 2
         
-        # Map number label
+        # Map number label - use fixed width frame for consistent alignment
+        # Use padx=(0, 2) to match header - only right padding, no left padding
+        map_label_frame = ttk.Frame(row_frame, width=70)  # Match header column width
+        map_label_frame.grid(row=0, column=0, padx=(0, 2), sticky=tk.W)
+        map_label_frame.grid_propagate(False)  # Don't let children resize frame
+        
         if bg_color:
-            map_label = tk.Label(row_frame, text=str(map_num), width=8, anchor=tk.CENTER, bg=bg_color)
+            map_label = tk.Label(map_label_frame, text=str(map_num), width=8, anchor=tk.CENTER, bg=bg_color)
         else:
-            map_label = ttk.Label(row_frame, text=str(map_num), width=8, anchor=tk.CENTER)
-        map_label.grid(row=0, column=0, padx=2, sticky=tk.W)
+            map_label = ttk.Label(map_label_frame, text=str(map_num), width=8, anchor=tk.CENTER)
+        map_label.pack(anchor=tk.W)
         
-        # Tracking checkbox - use grid for alignment
-        tracking_cb = ttk.Checkbutton(row_frame, variable=self.tracking_vars[map_num])
-        tracking_cb.grid(row=0, column=1, padx=2, sticky=tk.W)
+        # Tracking checkbox - use grid for alignment with fixed width frame
+        # Use padx=(0, 2) to match header - only right padding
+        tracking_frame = ttk.Frame(row_frame, width=90)
+        tracking_frame.grid(row=0, column=1, padx=(0, 2), sticky=tk.W)
+        tracking_frame.grid_propagate(False)
+        tracking_cb = ttk.Checkbutton(tracking_frame, variable=self.tracking_vars[map_num])
+        tracking_cb.pack(anchor=tk.W)
         # Now set the command after the variable is set
         tracking_cb.configure(command=lambda mn=map_num: self.on_checkbox_change(mn, "tracking"))
         
-        # Finished checkbox - use grid for alignment
-        finished_cb = ttk.Checkbutton(row_frame, variable=self.finished_vars[map_num])
-        finished_cb.grid(row=0, column=2, padx=2, sticky=tk.W)
+        # Finished checkbox - use grid for alignment with fixed width frame
+        # Use padx=(0, 2) to match header - only right padding
+        finished_frame_cb = ttk.Frame(row_frame, width=90)
+        finished_frame_cb.grid(row=0, column=2, padx=(0, 2), sticky=tk.W)
+        finished_frame_cb.grid_propagate(False)
+        finished_cb = ttk.Checkbutton(finished_frame_cb, variable=self.finished_vars[map_num])
+        finished_cb.pack(anchor=tk.W)
         # Now set the command after the variable is set
         finished_cb.configure(command=lambda mn=map_num: self.on_checkbox_change(mn, "finished"))
         
-        # Pack the row frame itself
-        row_frame.pack(fill=tk.X, pady=1)
+        # Pack the row frame itself - no horizontal padding to ensure alignment
+        row_frame.pack(fill=tk.X, pady=1, padx=0)
         
         self.map_rows[map_num] = row_frame
     
@@ -359,8 +463,8 @@ class KackyWatcherGUI:
                 self.watcher.watchlist_added = True
                 # Trigger immediate fetch
                 self.immediate_fetch_event.set()
-                # Force display refresh to show new map immediately (even if no ETA yet)
-                self.root.after(50, self._refresh_display)
+                # Schedule refresh (non-blocking, allows GUI to process resize events)
+                self._schedule_refresh()
     
     def load_map_status(self) -> None:
         """Load map status from JSON and populate the list."""
@@ -387,13 +491,58 @@ class KackyWatcherGUI:
     
     def update_status(self, message: str) -> None:
         """
-        Update status bar.
+        Update status bar (called on main thread).
         
         Args:
             message: Status message to display
         """
         timestamp = time.strftime("%H:%M:%S")
         self.status_label.config(text=f"[{timestamp}] {message}")
+    
+    def _queue_status_update(self, message: str) -> None:
+        """
+        Queue a status update from watcher thread (non-blocking).
+        
+        Args:
+            message: Status message to display
+        """
+        try:
+            self.update_queue.put_nowait(("status", {"message": message}))
+        except queue.Full:
+            pass  # Queue full, skip this update
+    
+    def _start_queue_processor(self) -> None:
+        """Start processing updates from the queue on the main thread."""
+        def process_queue():
+            """Process all available queue items (called on main thread)."""
+            processed_count = 0
+            max_items_per_cycle = 10  # Limit items per cycle to avoid blocking
+            
+            while processed_count < max_items_per_cycle:
+                try:
+                    update_type, data = self.update_queue.get_nowait()
+                    
+                    if update_type == "summary":
+                        self._update_output(data["live_maps"], data["tracked_lines"])
+                    elif update_type == "live_notification":
+                        self._show_live_notification(data["map_number"], data["server"])
+                    elif update_type == "status":
+                        self.update_status(data["message"])
+                    
+                    processed_count += 1
+                except queue.Empty:
+                    break
+            
+            # Schedule next check (use after_idle to process during GUI idle time)
+            if processed_count > 0:
+                # If we processed items, check again soon
+                self.root.after(10, process_queue)
+            else:
+                # If queue is empty, check less frequently
+                self.root.after(100, process_queue)
+        
+        # Start processing
+        self.root.after_idle(process_queue)
     
     def on_live_notification(self, map_number: int, server: str) -> None:
         """
@@ -403,11 +552,14 @@ class KackyWatcherGUI:
             map_number: Map number that went live
             server: Server name or empty string
         """
-        # This will be called from watcher thread, so schedule GUI update
-        self.root.after(0, lambda: self._show_live_notification(map_number, server))
+        # Put notification in queue (non-blocking)
+        try:
+            self.update_queue.put_nowait(("live_notification", {"map_number": map_number, "server": server}))
+        except queue.Full:
+            pass  # Queue full, skip this update
     
     def _show_live_notification(self, map_number: int, server: str) -> None:
-        """Show live notification in GUI (called on main thread)."""
+        """Show live notification in GUI (called on main thread from queue processor)."""
         server_text = f" on {server}" if server else ""
         self.update_status(f"🎉 Map #{map_number} is LIVE{server_text}!")
         
@@ -416,7 +568,7 @@ class KackyWatcherGUI:
         if map_number in self.transition_refetch_timers:
             self.root.after_cancel(self.transition_refetch_timers[map_number])
         
-        # Schedule refetch after 80 seconds
+        # Schedule refetch after 100 seconds
         def transition_refetch():
             """Trigger fetch after map transition period."""
             if self.watcher and self.running:
@@ -427,7 +579,7 @@ class KackyWatcherGUI:
             if map_number in self.transition_refetch_timers:
                 del self.transition_refetch_timers[map_number]
         
-        timer_id = self.root.after(80000, transition_refetch)
+        timer_id = self.root.after(100000, transition_refetch)
         self.transition_refetch_timers[map_number] = timer_id
     
     def on_summary_update(self, live_maps: List[int], tracked_lines: List[Tuple[int, str]]) -> None:
@@ -438,22 +590,93 @@ class KackyWatcherGUI:
             live_maps: List of live map numbers
             tracked_lines: List of (eta_seconds, line_text) tuples
         """
-        # This will be called from watcher thread, so schedule GUI update
-        self.root.after(0, lambda: self._update_output(live_maps, tracked_lines))
+        # Put update in queue instead of directly calling GUI (non-blocking)
+        try:
+            self.update_queue.put_nowait(("summary", {"live_maps": live_maps, "tracked_lines": tracked_lines}))
+        except queue.Full:
+            pass  # Queue full, skip this update
     
     def _update_output(self, live_maps: List[int], tracked_lines: List[Tuple[int, str]]) -> None:
         """Update output display (called on main thread)."""
         self.live_maps = live_maps
         self.tracked_lines = tracked_lines
-        # Force refresh to ensure new maps appear immediately
+        # Schedule refresh instead of immediate (allows GUI to process resize events)
+        self._schedule_refresh()
+    
+    def _schedule_refresh(self) -> None:
+        """Schedule a display refresh (throttled to avoid blocking GUI)."""
+        if self.pending_refresh:
+            return  # Already scheduled
+        
+        now_ms = time.time() * 1000
+        time_since_last = now_ms - (self.last_refresh_time * 1000)
+        
+        if time_since_last >= self.refresh_throttle_ms:
+            # Enough time has passed, refresh immediately on next idle
+            self.pending_refresh = True
+            if self.refresh_timer_id:
+                self.root.after_cancel(self.refresh_timer_id)
+            self.root.after_idle(self._process_refresh)
+        else:
+            # Schedule refresh after throttle period
+            delay_ms = int(self.refresh_throttle_ms - time_since_last)
+            self.pending_refresh = True
+            if self.refresh_timer_id:
+                self.root.after_cancel(self.refresh_timer_id)
+            self.refresh_timer_id = self.root.after(delay_ms, self._process_refresh)
+    
+    def _process_refresh(self) -> None:
+        """Process the scheduled refresh (called on main thread)."""
+        self.pending_refresh = False
+        self.refresh_timer_id = None
+        self.last_refresh_time = time.time()
         self._refresh_display()
     
+    def _on_resize_start(self, event=None) -> None:
+        """Handle resize start - pause refreshes during resize."""
+        # Only care about actual resize events (not just any configure)
+        if event and event.widget == self.root:
+            # Window resize - check if size actually changed
+            if not hasattr(self, '_last_window_size'):
+                self._last_window_size = (self.root.winfo_width(), self.root.winfo_height())
+            current_size = (self.root.winfo_width(), self.root.winfo_height())
+            if current_size == self._last_window_size:
+                return  # Not actually resizing
+            self._last_window_size = current_size
+        
+        self.is_resizing = True
+        # Cancel any pending refresh
+        if self.refresh_timer_id:
+            self.root.after_cancel(self.refresh_timer_id)
+            self.refresh_timer_id = None
+        self.pending_refresh = False
+        
+        # Cancel existing resize end timer
+        if self.resize_timer_id:
+            self.root.after_cancel(self.resize_timer_id)
+        
+        # Schedule resize end detection (after 150ms of no resize events)
+        self.resize_timer_id = self.root.after(150, self._on_resize_end)
+    
+    def _on_resize_end(self) -> None:
+        """Handle resize end - resume refreshes."""
+        self.is_resizing = False
+        # Schedule a refresh now that resize is done
+        if not self.pending_refresh:
+            self._schedule_refresh()
+    
     def _refresh_display(self) -> None:
-        """Refresh the display with current countdown values."""
+        """Refresh the display with current countdown values (called on main thread)."""
+        # Skip refresh if currently resizing
+        if self.is_resizing:
+            return
+        
         now_ts = time.time()
         
+        # Build content as string first (much faster than multiple inserts)
+        content_lines = []
+        
         self.output_text.config(state=tk.NORMAL)
-        self.output_text.delete("1.0", tk.END)
         
         # Format live section
         if self.watcher and hasattr(self.watcher, 'state'):
@@ -473,7 +696,7 @@ class KackyWatcherGUI:
             )
             
             if live_summary:
-                self.output_text.insert(tk.END, "Live:\n", "live_header")
+                content_lines.append(("Live:\n", "live_header"))
                 for mn in live_summary:
                     # Get servers and remaining time from watcher state
                     servers = sorted(self.watcher.state.live_servers_by_map.get(mn, set()))
@@ -483,22 +706,22 @@ class KackyWatcherGUI:
                     
                     remaining_str = f" ({remaining_sec//60}:{remaining_sec%60:02d} remaining)" if remaining_sec > 0 else ""
                     if servers:
-                        self.output_text.insert(tk.END, f"- {mn} on {', '.join(servers)}{remaining_str}\n")
+                        content_lines.append((f"- {mn} on {', '.join(servers)}{remaining_str}\n", None))
                     else:
-                        self.output_text.insert(tk.END, f"- {mn}{remaining_str}\n")
-                self.output_text.insert(tk.END, "\n")
+                        content_lines.append((f"- {mn}{remaining_str}\n", None))
+                content_lines.append(("\n", None))
             else:
-                self.output_text.insert(tk.END, "Live:\n(none)\n\n")
+                content_lines.append(("Live:\n(none)\n\n", None))
         elif self.live_maps:
-            self.output_text.insert(tk.END, "Live:\n", "live_header")
+            content_lines.append(("Live:\n", "live_header"))
             for mn in self.live_maps:
-                self.output_text.insert(tk.END, f"- {mn}\n")
-            self.output_text.insert(tk.END, "\n")
+                content_lines.append((f"- {mn}\n", None))
+            content_lines.append(("\n", None))
         else:
-            self.output_text.insert(tk.END, "Live:\n(none)\n\n")
+            content_lines.append(("Live:\n(none)\n\n", None))
         
         # Format tracked section
-        self.output_text.insert(tk.END, "Tracked:\n", "tracked_header")
+        content_lines.append(("Tracked:\n", "tracked_header"))
         if self.watcher and hasattr(self.watcher, 'state'):
             tracked_display_lines = []
             BIG = 10**9
@@ -553,16 +776,24 @@ class KackyWatcherGUI:
             
             # Sort by ETA
             for _, line in sorted(tracked_display_lines, key=lambda x: x[0]):
-                self.output_text.insert(tk.END, f"{line}\n")
+                content_lines.append((f"{line}\n", None))
             
             if not tracked_display_lines:
-                self.output_text.insert(tk.END, "(none)\n")
+                content_lines.append(("(none)\n", None))
         elif self.tracked_lines:
             # Fallback to stored tracked_lines if watcher not available
             for _, line in sorted(self.tracked_lines, key=lambda x: x[0]):
-                self.output_text.insert(tk.END, f"{line}\n")
+                content_lines.append((f"{line}\n", None))
         else:
-            self.output_text.insert(tk.END, "(none)\n")
+            content_lines.append(("(none)\n", None))
+        
+        # Now do a single delete and batch insert (much faster than multiple inserts)
+        self.output_text.delete("1.0", tk.END)
+        for text, tag in content_lines:
+            if tag:
+                self.output_text.insert(tk.END, text, tag)
+            else:
+                self.output_text.insert(tk.END, text)
         
         # Configure text tags for styling
         self.output_text.tag_config("live_header", font=("Consolas", 10, "bold"), foreground="green")
@@ -591,7 +822,8 @@ class KackyWatcherGUI:
                 else:
                     self.last_countdown_update = now
             
-            self._refresh_display()
+            # Schedule refresh instead of immediate (non-blocking)
+            self._schedule_refresh()
             
             # Schedule next update
             self.countdown_timer_id = self.root.after(1000, countdown_update)
@@ -610,7 +842,7 @@ class KackyWatcherGUI:
             """Watcher thread main loop."""
             self.watcher = KackyWatcher(
                 config=self.config,
-                on_status_update=lambda msg: self.root.after(0, lambda: self.update_status(msg)),
+                on_status_update=lambda msg: self._queue_status_update(msg),
                 on_live_notification=self.on_live_notification,
                 on_summary_update=self.on_summary_update,
             )
@@ -639,12 +871,16 @@ class KackyWatcherGUI:
                         # If no fetch time calculated, use minimal sleep
                         time.sleep(0.5)
                 except Exception as e:
-                    self.root.after(0, lambda: self.update_status(f"Watcher error: {e}"))
+                    self._queue_status_update(f"Watcher error: {e}")
                     time.sleep(1)
         
         self.watcher_thread = threading.Thread(target=watcher_loop, daemon=True)
         self.watcher_thread.start()
-        self.update_status("Watcher started")
+        
+        # Start queue processor to handle updates from watcher thread
+        self._start_queue_processor()
+        
+        self._queue_status_update("Watcher started")
     
     def stop_watcher(self) -> None:
         """Stop the watcher."""
