@@ -1,0 +1,377 @@
+"""
+Core watcher logic module for Kacky Watcher.
+Handles polling loop, fetch decisions, and state management.
+"""
+import os
+import re
+import time
+import logging
+from typing import Dict, List, Set, Tuple, Callable, Optional, Any
+
+from config import load_config, setup_logging
+from schedule_fetcher import fetch_schedule_html, fetch_schedule_html_browser
+from schedule_parser import parse_live_maps
+from map_status_manager import get_tracking_maps
+from watcher_state import WatcherState
+
+
+class KackyWatcher:
+    """
+    Main watcher class that handles polling and state management.
+    Uses callbacks to communicate with GUI or CLI.
+    """
+    
+    def __init__(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        on_status_update: Optional[Callable[[str], None]] = None,
+        on_live_notification: Optional[Callable[[int, str], None]] = None,
+        on_summary_update: Optional[Callable[[List[int], List[tuple]], None]] = None,
+    ):
+        """
+        Initialize watcher.
+        
+        Args:
+            config: Configuration dictionary (if None, loads from .env)
+            on_status_update: Callback(status_message: str) for status updates
+            on_live_notification: Callback(map_number: int, server: str) for live notifications
+            on_summary_update: Callback(live_maps: List[int], tracked_lines: List[tuple[int, str]]) for summary
+        """
+        self.config = config or load_config()
+        setup_logging(self.config["LOG_LEVEL"])
+        
+        self.on_status_update = on_status_update or (lambda msg: None)
+        self.on_live_notification = on_live_notification or (lambda mn, srv: None)
+        self.on_summary_update = on_summary_update or (lambda live, tracked: None)
+        
+        self.state = WatcherState(self.config["LIVE_DURATION_SECONDS"])
+        self.status_file = "map_status.json"
+        self.last_status_mtime = os.path.getmtime(self.status_file) if os.path.exists(self.status_file) else 0.0
+        self.last_status_check = 0.0
+        self.watchlist_added = False
+        self.watched: Set[int] = get_tracking_maps(self.status_file)
+        
+        if not self.watched:
+            logging.warning("No maps are being tracked. Check maps in the GUI to start tracking.")
+        
+        logging.info("Watching %d map(s): %s", len(self.watched), ", ".join(map(str, sorted(self.watched))) if self.watched else "<none>")
+        logging.info("Polling https://kacky.gg/schedule every %ss", self.config["CHECK_INTERVAL_SECONDS"])
+    
+    def reload_status(self) -> bool:
+        """
+        Reload map status if file changed.
+        
+        Returns:
+            True if status was reloaded and new maps were added
+        """
+        now = time.time()
+        if now - self.last_status_check < self.config["WATCHLIST_REFRESH_SECONDS"]:
+            return False
+        
+        self.last_status_check = now
+        try:
+            mtime = os.path.getmtime(self.status_file) if os.path.exists(self.status_file) else 0.0
+            if mtime and mtime != self.last_status_mtime:
+                prev_watched = set(self.watched)
+                self.watched = get_tracking_maps(self.status_file)
+                self.last_status_mtime = mtime
+                logging.info("Reloaded map status: %s", sorted(self.watched))
+                added = self.watched - prev_watched
+                if added:
+                    logging.debug("New map(s) added: %s", sorted(added))
+                    self.watchlist_added = True
+                    return True
+        except Exception:
+            logging.debug("Could not stat/reload map status.")
+        
+        return False
+    
+    def should_fetch(self, now_ts: float) -> Tuple[bool, Optional[str], List[Tuple[int, int, str]]]:
+        """
+        Determine if we should fetch the schedule.
+        
+        Args:
+            now_ts: Current timestamp
+            
+        Returns:
+            Tuple of (should_fetch: bool, fetch_reason: str | None, triggering_maps: List)
+        """
+        # Check if any live maps are expiring soon
+        expiring_live = self.state.has_expiring_live_windows(
+            now_ts,
+            self.config["ETA_FETCH_THRESHOLD_SECONDS"],
+            margin_sec=5
+        )
+        
+        # Determine nearest ETA
+        threshold_sec = self.config["ETA_FETCH_THRESHOLD_SECONDS"]
+        nearest_eta, triggering_maps = self.state.get_nearest_eta(self.watched, threshold_sec, now_ts)
+        # Convert to list of tuples for consistency
+        
+        fetch_reason = None
+        if not self.state.eta_seconds_by_map:
+            fetch_reason = "initial"
+        elif self.watchlist_added:
+            fetch_reason = "watchlist_added"
+        elif expiring_live:
+            fetch_reason = "live_window_expiring"
+        elif nearest_eta <= threshold_sec:
+            fetch_reason = "eta_threshold"
+        
+        should_fetch = fetch_reason is not None
+        
+        logging.debug(
+            "Fetch decision: nearest_eta=%ss, threshold=%ss, watchlist_added=%s, should_fetch=%s (%s)",
+            nearest_eta,
+            threshold_sec,
+            self.watchlist_added,
+            should_fetch,
+            fetch_reason,
+        )
+        
+        return should_fetch, fetch_reason, triggering_maps
+    
+    def fetch_schedule(self) -> List[Dict[str, str]]:
+        """
+        Fetch and parse schedule HTML.
+        
+        Returns:
+            List of parsed schedule rows
+        """
+        rows: List[Dict[str, str]] = []
+        html = fetch_schedule_html(self.config["USER_AGENT"], self.config["REQUEST_TIMEOUT_SECONDS"])
+        logging.debug("Fetched %d chars of HTML", len(html))
+        rows = parse_live_maps(html)
+        logging.debug("Parsed %d schedule rows", len(rows))
+        
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            for i, r in enumerate(rows[:50]):  # cap to avoid flooding
+                logging.debug("Row %02d → map=%s server='%s' live=%s", i + 1, r.get("map_number"), r.get("server", ""), r.get("is_live"))
+        
+        if not rows and self.config.get("ENABLE_BROWSER"):
+            logging.debug("No rows via plain HTTP; trying headless browser (Playwright)…")
+            try:
+                html = fetch_schedule_html_browser(
+                    timeout=self.config["REQUEST_TIMEOUT_SECONDS"] * 2,
+                    user_agent=self.config["USER_AGENT"]
+                )
+                logging.debug("[browser] Fetched %d chars of HTML", len(html))
+                rows = parse_live_maps(html)
+                logging.debug("[browser] Parsed %d schedule rows", len(rows))
+            except Exception as e:
+                logging.error("Browser fetch failed: %s", e)
+        
+        if not rows:
+            logging.warning("Parsed 0 rows — site structure may have changed or is client-rendered.")
+        
+        return rows
+    
+    def format_summary(self, rows: List[Dict[str, str]], did_fetch: bool) -> Tuple[List[int], List[Tuple[int, str]]]:
+        """
+        Format summary data for display.
+        
+        Args:
+            rows: Parsed schedule rows
+            did_fetch: Whether we fetched this cycle
+            
+        Returns:
+            Tuple of (live_summary: List[int], tracked_lines: List[tuple[int, str]])
+        """
+        def eta_to_seconds(eta: str) -> int:
+            m = re.match(r"^(\d{1,2}):(\d{2})$", eta)
+            if not m:
+                return 10**9
+            return int(m.group(1)) * 60 + int(m.group(2))
+        
+        # Build earliest ETA per watched map when not live
+        earliest_eta_by_map: Dict[int, Dict[str, str]] = {}
+        for r in rows:
+            try:
+                mn = int(r.get("map_number", "0"))
+            except ValueError:
+                continue
+            if mn not in self.watched:
+                continue
+            if r.get("is_live"):
+                continue
+            eta = r.get("eta", "") or ""
+            if not eta:
+                continue
+            cur = earliest_eta_by_map.get(mn)
+            if cur is None or eta_to_seconds(eta) < eta_to_seconds(cur.get("eta", "999:59")):
+                earliest_eta_by_map[mn] = {"eta": eta, "server": r.get("server", "")}
+        
+        # Determine live maps for summary
+        now_ts = time.time()
+        live_now = self.state.update_from_fetch(rows, self.watched) if did_fetch else set()
+        live_summary = self.state.get_live_summary(self.watched, live_now, now_ts)
+        
+        # Build tracked lines
+        tracked_lines: List[Tuple[int, str]] = []
+        BIG = 10**9
+        
+        # First, add non-live maps
+        for mn in sorted(set(self.watched) - set(live_summary)):
+            eta_sec = BIG
+            line = f"- {mn} will be live in unknown"
+            
+            info = earliest_eta_by_map.get(mn)
+            if did_fetch and info:
+                m = re.match(r"^(\d{1,2}):(\d{2})$", info.get("eta", ""))
+                if m:
+                    eta_sec = int(m.group(1)) * 60 + int(m.group(2))
+                if info.get("server"):
+                    line = f"- {mn} will be live in {info['eta']} on {info['server']}"
+                else:
+                    line = f"- {mn} will be live in {info['eta']}"
+            else:
+                # Use predicted ETA if available
+                if mn in self.state.upcoming_by_map and self.state.upcoming_by_map[mn]:
+                    s, sec = self.state.upcoming_by_map[mn][0]
+                    eta_sec = sec
+                    if s:
+                        line = f"- {mn} will be live in {sec//60}:{sec%60:02d} on {s}"
+                    else:
+                        line = f"- {mn} will be live in {sec//60}:{sec%60:02d}"
+                elif mn in self.state.eta_seconds_by_map:
+                    sec = self.state.eta_seconds_by_map[mn]
+                    eta_sec = sec
+                    srv = self.state.server_by_map.get(mn, "")
+                    if srv:
+                        line = f"- {mn} will be live in {sec//60}:{sec%60:02d} on {srv}"
+                    else:
+                        line = f"- {mn} will be live in {sec//60}:{sec%60:02d}"
+            
+            tracked_lines.append((eta_sec, line))
+        
+        # Also add upcoming servers for live maps
+        for mn in live_summary:
+            if mn in self.state.upcoming_by_map and self.state.upcoming_by_map[mn]:
+                for s, sec in self.state.upcoming_by_map[mn]:
+                    tracked_lines.append((sec, f"- {mn} will be live in {sec//60}:{sec%60:02d} on {s}"))
+        
+        return live_summary, tracked_lines
+    
+    def poll_once(self) -> None:
+        """
+        Execute one polling cycle.
+        """
+        try:
+            logging.debug("Starting poll cycle…")
+            
+            # Reload map status if needed
+            self.reload_status()
+            
+            # Decide if we should fetch
+            now_ts = time.time()
+            should_fetch, fetch_reason, triggering_maps = self.should_fetch(now_ts)
+            
+            rows: List[Dict[str, str]] = []
+            did_fetch = False
+            
+            if should_fetch:
+                # Log fetch reason
+                if fetch_reason == "initial":
+                    logging.info("Fetching schedule (reason: initial state)")
+                    self.on_status_update("Fetching schedule (initial state)...")
+                elif fetch_reason == "watchlist_added":
+                    logging.info("Fetching schedule (reason: new map added to watchlist)")
+                    self.on_status_update("Fetching schedule (new map added)...")
+                elif fetch_reason == "live_window_expiring":
+                    logging.info("Fetching schedule (reason: live map window expiring soon)")
+                    self.on_status_update("Fetching schedule (live window expiring)...")
+                elif fetch_reason == "eta_threshold":
+                    threshold_sec = self.config["ETA_FETCH_THRESHOLD_SECONDS"]
+                    if triggering_maps:
+                        maps_str = ", ".join([
+                            f"#{mn} ({sec//60}:{sec%60:02d} on {srv})" if srv else f"#{mn} ({sec//60}:{sec%60:02d})"
+                            for mn, sec, srv in sorted(triggering_maps, key=lambda x: x[1])
+                        ])
+                        logging.info("Fetching schedule (reason: nearest tracked ETA ≤ %ss) - triggered by: %s", threshold_sec, maps_str)
+                        self.on_status_update(f"Fetching schedule (ETA threshold: {maps_str})...")
+                    else:
+                        logging.info("Fetching schedule (reason: nearest tracked ETA ≤ %ss)", threshold_sec)
+                        self.on_status_update(f"Fetching schedule (ETA threshold ≤ {threshold_sec}s)...")
+                
+                rows = self.fetch_schedule()
+                did_fetch = True
+            else:
+                # No fetch this cycle: count down predictions
+                dec = self.config["WATCHLIST_REFRESH_SECONDS"]
+                self.state.countdown_etas(dec)
+                
+                # Check if any watched map's ETA has hit 0 or gone negative (should be live now)
+                expired_etas = []
+                for mn in self.watched:
+                    # Check single ETA
+                    if mn in self.state.eta_seconds_by_map and self.state.eta_seconds_by_map[mn] <= 0:
+                        # Only trigger if not already in live window
+                        if mn not in self.state.live_until_by_map or self.state.live_until_by_map[mn] <= now_ts:
+                            expired_etas.append(mn)
+                    # Check upcoming servers
+                    if mn in self.state.upcoming_by_map:
+                        for srv, sec in self.state.upcoming_by_map[mn]:
+                            if sec <= 0:
+                                # Only trigger if not already in live window
+                                if mn not in self.state.live_until_by_map or self.state.live_until_by_map[mn] <= now_ts:
+                                    if mn not in expired_etas:
+                                        expired_etas.append(mn)
+                                    break
+                
+                if expired_etas:
+                    # ETA has expired, fetch immediately to catch map going live
+                    logging.info("Fetching schedule (reason: ETA expired for map(s): %s)", sorted(expired_etas))
+                    self.on_status_update(f"Fetching schedule (ETA expired: {', '.join(map(str, sorted(expired_etas)))})...")
+                    rows = self.fetch_schedule()
+                    did_fetch = True
+                else:
+                    self.on_status_update("Idle (counting down ETAs)...")
+            
+            # Update state and get live maps
+            if did_fetch:
+                live_now = self.state.update_from_fetch(rows, self.watched)
+                
+                # Notify for newly live maps
+                newly_live = self.state.get_newly_live(self.watched, live_now)
+                for mn in sorted(newly_live):
+                    server = next((r.get("server") for r in rows if r.get("map_number") == str(mn) and r.get("server")), "")
+                    self.on_live_notification(mn, server)
+                    logging.info("KACKY MAP LIVE: #%s on %s", mn, server if server else "<unknown server>")
+                self.state.mark_notified(newly_live)
+                
+                # Clear notifications for maps no longer live
+                no_longer_live = self.state.notified_live - live_now
+                if no_longer_live:
+                    for mn in sorted(no_longer_live):
+                        logging.debug("Map #%s no longer live", mn)
+                    self.state.clear_notifications_for(no_longer_live)
+            else:
+                live_now = set()
+            
+            # Format and send summary
+            live_summary, tracked_lines = self.format_summary(rows, did_fetch)
+            self.on_summary_update(live_summary, tracked_lines)
+            
+            # Reset watchlist trigger
+            self.watchlist_added = False
+            
+        except Exception as e:
+            logging.exception("Error in poll cycle: %s", e)
+            self.on_status_update(f"Error: {e}")
+    
+    def run(self) -> None:
+        """
+        Run the watcher in a continuous loop.
+        """
+        while True:
+            try:
+                self.poll_once()
+                sleep_sec = max(1, self.config["WATCHLIST_REFRESH_SECONDS"])
+                time.sleep(sleep_sec)
+            except KeyboardInterrupt:
+                logging.info("Exiting...")
+                break
+            except Exception as e:
+                logging.exception("Unexpected error: %s", e)
+                time.sleep(self.config["WATCHLIST_REFRESH_SECONDS"])
+
