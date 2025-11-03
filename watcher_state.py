@@ -152,7 +152,7 @@ class WatcherState:
         
         Args:
             watched: Set of watched map numbers
-            live_now: Set of maps currently live from latest fetch
+            live_now: Set of maps currently live from latest fetch (if empty, means no recent fetch)
             now_ts: Current timestamp
             
         Returns:
@@ -160,9 +160,23 @@ class WatcherState:
         """
         self.cleanup_expired_live_windows(now_ts)
         live_summary: List[int] = []
-        for mn in sorted(watched):
-            if mn in live_now or (mn in self.live_until_by_map and self.live_until_by_map[mn] > now_ts):
-                live_summary.append(mn)
+        
+        # If we have a recent fetch (live_now is not empty), use it as source of truth
+        # If live_now is empty, we're using cached state, so use live windows
+        if live_now:
+            # Recent fetch: only show maps that are actually live now
+            # Remove any maps from live_until_by_map that are not in live_now
+            for mn in list(self.live_until_by_map.keys()):
+                if mn not in live_now:
+                    del self.live_until_by_map[mn]
+                    self.live_servers_by_map.pop(mn, None)
+            live_summary = sorted(live_now & watched)
+        else:
+            # No recent fetch: use live windows for persistence
+            for mn in sorted(watched):
+                if mn in self.live_until_by_map and self.live_until_by_map[mn] > now_ts:
+                    live_summary.append(mn)
+        
         return live_summary
     
     def get_nearest_eta(self, watched: Set[int], threshold_sec: int, now_ts: float) -> Tuple[int, List[Tuple[int, int, str]]]:

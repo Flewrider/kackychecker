@@ -266,8 +266,16 @@ class KackyWatcher:
                 earliest_eta_by_map[mn] = {"eta": eta, "server": r.get("server", "")}
         
         # Determine live maps for summary
+        # Note: update_from_fetch was already called in poll_once if did_fetch is True
+        # So we just need to get the current live state, not update again
         now_ts = time.time()
-        live_now = self.state.update_from_fetch(rows, self.watched) if did_fetch else set()
+        if did_fetch:
+            # Build live_now set from rows (state was already updated in poll_once)
+            live_now = {int(r.get("map_number", "0")) for r in rows if r.get("is_live")}
+            # Filter to only watched maps
+            live_now = {mn for mn in live_now if mn in self.watched and mn > 0}
+        else:
+            live_now = set()
         live_summary = self.state.get_live_summary(self.watched, live_now, now_ts)
         
         # Build tracked lines
@@ -316,9 +324,12 @@ class KackyWatcher:
         
         return live_summary, tracked_lines
     
-    def poll_once(self) -> None:
+    def poll_once(self, force_fetch: bool = False) -> None:
         """
         Execute one polling cycle.
+        
+        Args:
+            force_fetch: If True, force a fetch regardless of should_fetch logic
         """
         try:
             logging.debug("Starting poll cycle…")
@@ -328,7 +339,12 @@ class KackyWatcher:
             
             # Decide if we should fetch
             now_ts = time.time()
-            should_fetch, fetch_reason, triggering_maps = self.should_fetch(now_ts)
+            if force_fetch:
+                should_fetch = True
+                fetch_reason = "forced"
+                triggering_maps = []
+            else:
+                should_fetch, fetch_reason, triggering_maps = self.should_fetch(now_ts)
             
             rows: List[Dict[str, str]] = []
             did_fetch = False
@@ -337,8 +353,8 @@ class KackyWatcher:
                 # Prevent rapid refetches - enforce minimum time between fetches (except for immediate triggers)
                 min_fetch_interval = 2.0  # Minimum 2 seconds between fetches
                 if now_ts - self.last_fetch_time < min_fetch_interval:
-                    # Skip fetch if too soon (unless it's a critical reason)
-                    if fetch_reason not in ("watchlist_added", "initial"):
+                    # Skip fetch if too soon (unless it's a critical reason or forced)
+                    if fetch_reason not in ("watchlist_added", "initial", "forced"):
                         should_fetch = False
                         logging.debug("Skipping fetch (too soon after last fetch: %.1fs)", now_ts - self.last_fetch_time)
                 

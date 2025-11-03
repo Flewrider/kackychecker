@@ -67,7 +67,7 @@ class KackyWatcherGUI:
         self.watcher_thread: Optional[threading.Thread] = None
         self.running = False
         self.immediate_fetch_event = threading.Event()  # Signal to trigger immediate fetch
-        self.transition_refetch_timers: dict[int, str] = {}  # Map number -> timer ID for transition refetches
+        self.transition_refetch_timers: dict[int, list[str]] = {}  # Map number -> list of timer IDs for transition refetches
         
         # Queue for thread-safe GUI updates (decouple watcher from GUI rendering)
         self.update_queue: queue.Queue = queue.Queue(maxsize=100)  # Limit queue size
@@ -578,32 +578,77 @@ class KackyWatcherGUI:
         self.update_status(f"🎉 Map #{map_number} is LIVE{server_text}!")
         
         # Show Windows toast notification if enabled
-        if self.config.get("ENABLE_NOTIFICATIONS", True) and self.toast:
+        if self.config.get("ENABLE_NOTIFICATIONS", True) and HAS_NOTIFICATIONS:
             try:
                 title = f"Map #{map_number} is LIVE!"
                 message = f"Map #{map_number} is now live{server_text}"
-                self.toast.show_toast(title, message, duration=5, threaded=True)
+                # Run notification in a separate thread to avoid blocking GUI
+                # Suppress win10toast errors that don't affect functionality
+                def show_notification():
+                    try:
+                        import sys
+                        import io
+                        # Temporarily suppress stderr to hide win10toast WPARAM errors
+                        old_stderr = sys.stderr
+                        sys.stderr = io.StringIO()
+                        try:
+                            # Create new instance in thread to avoid GUI thread conflicts
+                            toast = ToastNotifier()
+                            toast.show_toast(title, message, duration=5, threaded=False)
+                        finally:
+                            sys.stderr = old_stderr
+                    except Exception as e:
+                        # Only log if it's not the known WPARAM error
+                        if "WPARAM" not in str(e) and "classAtom" not in str(e):
+                            logging.warning(f"Failed to show notification: {e}")
+                
+                notification_thread = threading.Thread(target=show_notification, daemon=True)
+                notification_thread.start()
             except Exception as e:
-                logging.warning(f"Failed to show notification: {e}")
+                logging.warning(f"Failed to start notification thread: {e}")
         
-        # Schedule a refetch after ~1 minute to handle map transition period
-        # Cancel any existing timer for this map
+        # Schedule refetches at 30s and 60s after map goes live to handle transition periods
+        # The website shows both old and new maps briefly during transition
+        # Cancel any existing timers for this map
         if map_number in self.transition_refetch_timers:
-            self.root.after_cancel(self.transition_refetch_timers[map_number])
+            for timer_id in self.transition_refetch_timers[map_number]:
+                self.root.after_cancel(timer_id)
+            del self.transition_refetch_timers[map_number]
         
-        # Schedule refetch after 100 seconds
-        def transition_refetch():
-            """Trigger fetch after map transition period."""
-            if self.watcher and self.running:
-                logging.info("Fetching schedule (reason: map transition period - map #%s went live ~1 min ago)", map_number)
-                self.update_status(f"Refetching after map #{map_number} transition...")
-                self.immediate_fetch_event.set()
-            # Clean up timer reference
-            if map_number in self.transition_refetch_timers:
-                del self.transition_refetch_timers[map_number]
+        # Store timer IDs for this map (30s and 60s)
+        timer_ids = []
         
-        timer_id = self.root.after(100000, transition_refetch)
-        self.transition_refetch_timers[map_number] = timer_id
+        def create_refetch_handler(delay_sec: int, timer_id_ref: list):
+            """Create a refetch handler that can clean up its own timer."""
+            def do_refetch():
+                if self.watcher and self.running:
+                    logging.info("Fetching schedule (reason: map transition period - map #%s went live ~%ds ago)", map_number, delay_sec)
+                    self.update_status(f"Refetching after map #{map_number} transition ({delay_sec}s)...")
+                    self.immediate_fetch_event.set()
+                # Clean up timer reference
+                if map_number in self.transition_refetch_timers:
+                    # Remove this timer ID from the list
+                    if timer_id_ref[0] in self.transition_refetch_timers[map_number]:
+                        self.transition_refetch_timers[map_number].remove(timer_id_ref[0])
+                    if not self.transition_refetch_timers[map_number]:
+                        del self.transition_refetch_timers[map_number]
+            return do_refetch
+        
+        # Schedule 30 second refetch
+        timer_id_30_ref = [None]  # Use list to allow modification in closure
+        handler_30 = create_refetch_handler(30, timer_id_30_ref)
+        timer_id_30 = self.root.after(30000, handler_30)
+        timer_id_30_ref[0] = timer_id_30
+        timer_ids.append(timer_id_30)
+        
+        # Schedule 60 second refetch
+        timer_id_60_ref = [None]  # Use list to allow modification in closure
+        handler_60 = create_refetch_handler(60, timer_id_60_ref)
+        timer_id_60 = self.root.after(60000, handler_60)
+        timer_id_60_ref[0] = timer_id_60
+        timer_ids.append(timer_id_60)
+        
+        self.transition_refetch_timers[map_number] = timer_ids
     
     def on_summary_update(self, live_maps: List[int], tracked_lines: List[Tuple[int, str]]) -> None:
         """
@@ -839,8 +884,10 @@ class KackyWatcherGUI:
                     immediate_fetch = self.immediate_fetch_event.is_set()
                     if immediate_fetch:
                         self.immediate_fetch_event.clear()
-                    
-                    self.watcher.poll_once()
+                        # Force a fetch when immediate_fetch_event is set
+                        self.watcher.poll_once(force_fetch=True)
+                    else:
+                        self.watcher.poll_once()
                     self.last_fetch_timestamp = time.time()
                     self.last_countdown_update = time.time()  # Reset countdown timer on fetch
                     
@@ -984,13 +1031,21 @@ class KackyWatcherGUI:
                 self.config = load_config()
                 # Update logging level
                 setup_logging(self.config["LOG_LEVEL"])
+                
+                # Update watcher config if it exists
+                if self.watcher:
+                    self.watcher.config = self.config
+                    # Update live duration in state if it changed
+                    if hasattr(self.watcher, 'state') and hasattr(self.watcher.state, 'live_duration_seconds'):
+                        self.watcher.state.live_duration_seconds = self.config.get("LIVE_DURATION_SECONDS", 600)
+                
                 # Update toast notification availability
                 if self.config.get("ENABLE_NOTIFICATIONS", True) and HAS_NOTIFICATIONS:
                     self.toast = ToastNotifier() if not self.toast else self.toast
                 else:
                     self.toast = None
                 
-                messagebox.showinfo("Settings", "Settings saved successfully!\nSome changes may require restarting the watcher.")
+                messagebox.showinfo("Settings", "Settings saved successfully!\nChanges have been applied immediately.")
                 dialog.destroy()
             else:
                 messagebox.showerror("Error", "Failed to save settings file.")
