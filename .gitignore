@@ -32,3 +32,11 @@ Thumbs.db
 # Project specific
 *.log
 map_status.json
+settings.json
+watchlist.txt
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.pyc

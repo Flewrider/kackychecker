@@ -13,6 +13,7 @@ from schedule_fetcher import fetch_schedule_html, fetch_schedule_html_browser
 from schedule_parser import parse_live_maps
 from map_status_manager import get_tracking_maps
 from watcher_state import WatcherState
+from path_utils import get_map_status_file
 
 
 class KackyWatcher:
@@ -45,7 +46,7 @@ class KackyWatcher:
         self.on_summary_update = on_summary_update or (lambda live, tracked: None)
         
         self.state = WatcherState(self.config["LIVE_DURATION_SECONDS"])
-        self.status_file = "map_status.json"
+        self.status_file = get_map_status_file()
         self.last_status_mtime = os.path.getmtime(self.status_file) if os.path.exists(self.status_file) else 0.0
         self.last_status_check = 0.0
         self.watchlist_added = False

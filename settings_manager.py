@@ -7,8 +7,10 @@ import os
 import logging
 from typing import Dict, Any, Optional
 
+from path_utils import get_settings_file
 
-SETTINGS_FILE = "settings.json"
+
+SETTINGS_FILE = "settings.json"  # For backward compatibility, actual path comes from get_settings_file()
 
 
 def get_default_settings() -> Dict[str, Any]:
@@ -34,11 +36,12 @@ def load_settings() -> Dict[str, Any]:
     Returns:
         Dictionary containing all settings with appropriate types.
     """
-    if not os.path.exists(SETTINGS_FILE):
+    settings_path = get_settings_file()
+    if not os.path.exists(settings_path):
         return get_default_settings()
     
     try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+        with open(settings_path, "r", encoding="utf-8") as f:
             loaded = json.load(f)
         
         # Merge with defaults to ensure all keys exist
@@ -61,7 +64,8 @@ def save_settings(settings: Dict[str, Any]) -> bool:
         True if successful, False otherwise
     """
     try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        settings_path = get_settings_file()
+        with open(settings_path, "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2, ensure_ascii=False)
         return True
     except IOError as e:

@@ -6,17 +6,22 @@ import os
 import re
 from typing import Set
 
+from path_utils import get_watchlist_file
 
-def load_watchlist(path: str = "watchlist.txt") -> Set[int]:
+
+def load_watchlist(path: str = None) -> Set[int]:
     """
     Load map numbers from watchlist file.
     
     Args:
-        path: Path to watchlist file
+        path: Path to watchlist file (if None, uses default from path_utils)
         
     Returns:
         Set of map numbers (integers)
     """
+    if path is None:
+        path = get_watchlist_file()
+    
     watched: Set[int] = set()
     if not os.path.exists(path):
         return watched
@@ -35,14 +40,17 @@ def load_watchlist(path: str = "watchlist.txt") -> Set[int]:
     return watched
 
 
-def save_watchlist(map_numbers: Set[int], path: str = "watchlist.txt") -> None:
+def save_watchlist(map_numbers: Set[int], path: str = None) -> None:
     """
     Save map numbers to watchlist file.
     
     Args:
         map_numbers: Set of map numbers to save
-        path: Path to watchlist file
+        path: Path to watchlist file (if None, uses default from path_utils)
     """
+    if path is None:
+        path = get_watchlist_file()
+    
     with open(path, "w", encoding="utf-8") as f:
         f.write("# One map number per line. Lines starting with # are comments.\n")
         f.write("# Examples:\n")
