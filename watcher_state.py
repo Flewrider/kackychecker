@@ -206,7 +206,7 @@ class WatcherState:
         
         return nearest_eta, triggering_maps
     
-    def has_expiring_live_windows(self, now_ts: float, threshold_sec: int, margin_sec: int = 5) -> bool:
+    def has_expiring_live_windows(self, now_ts: float, threshold_sec: int, margin_sec: int = 5, watched: Optional[Set[int]] = None) -> bool:
         """
         Check if any live windows are expiring soon.
         
@@ -214,11 +214,15 @@ class WatcherState:
             now_ts: Current timestamp
             threshold_sec: ETA threshold in seconds
             margin_sec: Additional margin in seconds
+            watched: Optional set of watched map numbers to filter by
             
         Returns:
-            True if any live window expires within threshold + margin
+            True if any live window (for watched maps if specified) expires within threshold + margin
         """
-        for until_ts in self.live_until_by_map.values():
+        for mn, until_ts in self.live_until_by_map.items():
+            # Only check watched maps if watched set is provided
+            if watched is not None and mn not in watched:
+                continue
             if until_ts <= now_ts + threshold_sec + margin_sec:
                 return True
         return False
@@ -253,4 +257,68 @@ class WatcherState:
             map_numbers: Set of map numbers to clear
         """
         self.notified_live -= map_numbers
+    
+    def get_next_live_window_expiry(self, now_ts: float, watched: Optional[Set[int]] = None) -> Optional[float]:
+        """
+        Get the timestamp when the next live window expires.
+        
+        Args:
+            now_ts: Current timestamp
+            watched: Optional set of watched map numbers to filter by
+            
+        Returns:
+            Timestamp of next expiry, or None if no live windows (for watched maps if specified)
+        """
+        if not self.live_until_by_map:
+            return None
+        
+        # Filter by watched maps if provided
+        relevant_expiries = []
+        for mn, until_ts in self.live_until_by_map.items():
+            if watched is None or mn in watched:
+                relevant_expiries.append(until_ts)
+        
+        if not relevant_expiries:
+            return None
+        return min(relevant_expiries)
+    
+    def get_next_eta_expiry(self, watched: Set[int], now_ts: float) -> Optional[int]:
+        """
+        Get the seconds until the next ETA expires (hits 0).
+        
+        Args:
+            watched: Set of watched map numbers
+            now_ts: Current timestamp
+            
+        Returns:
+            Seconds until next ETA expires, or None if no ETAs
+        """
+        candidates = []
+        # Check single ETAs
+        for mn, sec in self.eta_seconds_by_map.items():
+            if mn in watched and sec > 0:
+                # Skip if this map is currently live
+                if mn not in self.live_until_by_map or self.live_until_by_map[mn] <= now_ts:
+                    candidates.append(sec)
+        
+        # Check upcoming servers for live maps
+        for mn, items in self.upcoming_by_map.items():
+            if mn in watched:
+                # Check if map is live
+                is_live = mn in self.live_until_by_map and self.live_until_by_map[mn] > now_ts
+                if is_live:
+                    # Map is live, check upcoming servers
+                    for s, t in items:
+                        if t > 0:
+                            candidates.append(t)
+                            break
+                else:
+                    # Map not live, check ETAs
+                    for s, t in items:
+                        if t > 0:
+                            candidates.append(t)
+        
+        if not candidates:
+            return None
+        return min(candidates)
 

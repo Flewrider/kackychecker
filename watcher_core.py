@@ -49,6 +49,7 @@ class KackyWatcher:
         self.last_status_mtime = os.path.getmtime(self.status_file) if os.path.exists(self.status_file) else 0.0
         self.last_status_check = 0.0
         self.watchlist_added = False
+        self.last_fetch_time = 0.0  # Track when we last fetched to prevent rapid refetches
         self.watched: Set[int] = get_tracking_maps(self.status_file)
         
         if not self.watched:
@@ -96,11 +97,14 @@ class KackyWatcher:
         Returns:
             Tuple of (should_fetch: bool, fetch_reason: str | None, triggering_maps: List)
         """
-        # Check if any live maps are expiring soon
+        # Check if any live maps are expiring very soon (within 10 seconds)
+        # Use a tight threshold to avoid excessive fetching
+        # Only check tracked maps
         expiring_live = self.state.has_expiring_live_windows(
             now_ts,
-            self.config["ETA_FETCH_THRESHOLD_SECONDS"],
-            margin_sec=5
+            threshold_sec=10,  # Only fetch when very close to expiry
+            margin_sec=0,
+            watched=self.watched  # Only check tracked maps
         )
         
         # Determine nearest ETA
@@ -130,6 +134,66 @@ class KackyWatcher:
         )
         
         return should_fetch, fetch_reason, triggering_maps
+    
+    def calculate_next_fetch_time(self, now_ts: float) -> float:
+        """
+        Calculate how many seconds until the next fetch is needed.
+        
+        Args:
+            now_ts: Current timestamp
+            
+        Returns:
+            Seconds until next fetch (0 if immediate fetch needed, max 300 seconds)
+        """
+        # If watchlist was added, fetch immediately
+        if self.watchlist_added:
+            return 0.0
+        
+        # Calculate time until next live window expires (only for tracked maps)
+        next_live_expiry = self.state.get_next_live_window_expiry(now_ts, watched=self.watched)
+        time_until_live_expiry = None
+        if next_live_expiry:
+            time_until_live_expiry = max(0.0, next_live_expiry - now_ts)
+            # Only fetch when very close to expiry (within 10 seconds) to avoid continuous fetching
+            # This allows the live window to persist naturally without constant refetches
+            if time_until_live_expiry <= 10.0:
+                return 0.0  # Fetch immediately if expiring very soon (within 10s)
+            # Otherwise, return time until we need to fetch (when within 10s of expiry)
+            # This prevents fetching too early - wait until 10s before expiry
+            return max(1.0, time_until_live_expiry - 10.0)
+        
+        # Calculate time until next ETA expires
+        next_eta_sec = self.state.get_next_eta_expiry(self.watched, now_ts)
+        time_until_eta_expiry = None
+        if next_eta_sec is not None:
+            time_until_eta_expiry = float(next_eta_sec)
+            # If ETA is within threshold, fetch immediately
+            if time_until_eta_expiry <= self.config["ETA_FETCH_THRESHOLD_SECONDS"]:
+                return 0.0
+        
+        # If no state and no watched maps, fetch immediately (initial state)
+        # But if there are watched maps but no ETAs yet, wait a reasonable time before refetching
+        if not self.state.eta_seconds_by_map and not self.state.live_until_by_map:
+            if not self.watched:
+                # No watched maps at all - no need to fetch
+                return 300.0
+            # Have watched maps but no ETAs - wait a bit before refetching (e.g., 30 seconds)
+            # This prevents continuous fetching when a new map is added but not in schedule yet
+            return 30.0
+        
+        # Find minimum time until next event
+        candidates = []
+        if time_until_live_expiry is not None:
+            candidates.append(time_until_live_expiry)
+        if time_until_eta_expiry is not None:
+            candidates.append(time_until_eta_expiry)
+        
+        if not candidates:
+            # No events scheduled, use a reasonable default (5 minutes)
+            return 300.0
+        
+        # Return minimum time, capped at 5 minutes
+        return min(min(candidates), 300.0)
     
     def fetch_schedule(self) -> List[Dict[str, str]]:
         """
@@ -270,36 +334,45 @@ class KackyWatcher:
             did_fetch = False
             
             if should_fetch:
-                # Log fetch reason
-                if fetch_reason == "initial":
-                    logging.info("Fetching schedule (reason: initial state)")
-                    self.on_status_update("Fetching schedule (initial state)...")
-                elif fetch_reason == "watchlist_added":
-                    logging.info("Fetching schedule (reason: new map added to watchlist)")
-                    self.on_status_update("Fetching schedule (new map added)...")
-                elif fetch_reason == "live_window_expiring":
-                    logging.info("Fetching schedule (reason: live map window expiring soon)")
-                    self.on_status_update("Fetching schedule (live window expiring)...")
-                elif fetch_reason == "eta_threshold":
-                    threshold_sec = self.config["ETA_FETCH_THRESHOLD_SECONDS"]
-                    if triggering_maps:
-                        maps_str = ", ".join([
-                            f"#{mn} ({sec//60}:{sec%60:02d} on {srv})" if srv else f"#{mn} ({sec//60}:{sec%60:02d})"
-                            for mn, sec, srv in sorted(triggering_maps, key=lambda x: x[1])
-                        ])
-                        logging.info("Fetching schedule (reason: nearest tracked ETA ≤ %ss) - triggered by: %s", threshold_sec, maps_str)
-                        self.on_status_update(f"Fetching schedule (ETA threshold: {maps_str})...")
-                    else:
-                        logging.info("Fetching schedule (reason: nearest tracked ETA ≤ %ss)", threshold_sec)
-                        self.on_status_update(f"Fetching schedule (ETA threshold ≤ {threshold_sec}s)...")
+                # Prevent rapid refetches - enforce minimum time between fetches (except for immediate triggers)
+                min_fetch_interval = 2.0  # Minimum 2 seconds between fetches
+                if now_ts - self.last_fetch_time < min_fetch_interval:
+                    # Skip fetch if too soon (unless it's a critical reason)
+                    if fetch_reason not in ("watchlist_added", "initial"):
+                        should_fetch = False
+                        logging.debug("Skipping fetch (too soon after last fetch: %.1fs)", now_ts - self.last_fetch_time)
+                
+                if should_fetch:
+                    # Log fetch reason
+                    if fetch_reason == "initial":
+                        logging.info("Fetching schedule (reason: initial state)")
+                        self.on_status_update("Fetching schedule (initial state)...")
+                    elif fetch_reason == "watchlist_added":
+                        logging.info("Fetching schedule (reason: new map added to watchlist)")
+                        self.on_status_update("Fetching schedule (new map added)...")
+                    elif fetch_reason == "live_window_expiring":
+                        logging.info("Fetching schedule (reason: live map window expiring soon)")
+                        self.on_status_update("Fetching schedule (live window expiring)...")
+                    elif fetch_reason == "eta_threshold":
+                        threshold_sec = self.config["ETA_FETCH_THRESHOLD_SECONDS"]
+                        if triggering_maps:
+                            maps_str = ", ".join([
+                                f"#{mn} ({sec//60}:{sec%60:02d} on {srv})" if srv else f"#{mn} ({sec//60}:{sec%60:02d})"
+                                for mn, sec, srv in sorted(triggering_maps, key=lambda x: x[1])
+                            ])
+                            logging.info("Fetching schedule (reason: nearest tracked ETA ≤ %ss) - triggered by: %s", threshold_sec, maps_str)
+                            self.on_status_update(f"Fetching schedule (ETA threshold: {maps_str})...")
+                        else:
+                            logging.info("Fetching schedule (reason: nearest tracked ETA ≤ %ss)", threshold_sec)
+                            self.on_status_update(f"Fetching schedule (ETA threshold ≤ {threshold_sec}s)...")
                 
                 rows = self.fetch_schedule()
                 did_fetch = True
+                self.last_fetch_time = now_ts
             else:
-                # No fetch this cycle: count down predictions
-                dec = self.config["WATCHLIST_REFRESH_SECONDS"]
-                self.state.countdown_etas(dec)
-                
+                # No fetch this cycle: don't countdown here
+                # The GUI timer handles countdown for smooth display in GUI mode
+                # For CLI mode, countdown happens in the sleep loop
                 # Check if any watched map's ETA has hit 0 or gone negative (should be live now)
                 expired_etas = []
                 for mn in self.watched:
@@ -320,10 +393,15 @@ class KackyWatcher:
                 
                 if expired_etas:
                     # ETA has expired, fetch immediately to catch map going live
-                    logging.info("Fetching schedule (reason: ETA expired for map(s): %s)", sorted(expired_etas))
-                    self.on_status_update(f"Fetching schedule (ETA expired: {', '.join(map(str, sorted(expired_etas)))})...")
-                    rows = self.fetch_schedule()
-                    did_fetch = True
+                    # Check if enough time has passed since last fetch
+                    if now_ts - self.last_fetch_time >= 2.0:
+                        logging.info("Fetching schedule (reason: ETA expired for map(s): %s)", sorted(expired_etas))
+                        self.on_status_update(f"Fetching schedule (ETA expired: {', '.join(map(str, sorted(expired_etas)))})...")
+                        rows = self.fetch_schedule()
+                        did_fetch = True
+                        self.last_fetch_time = now_ts
+                    else:
+                        logging.debug("Skipping fetch for expired ETA (too soon after last fetch)")
                 else:
                     self.on_status_update("Idle (counting down ETAs)...")
             
@@ -366,12 +444,25 @@ class KackyWatcher:
         while True:
             try:
                 self.poll_once()
-                sleep_sec = max(1, self.config["WATCHLIST_REFRESH_SECONDS"])
-                time.sleep(sleep_sec)
+                
+                # Calculate next fetch time dynamically
+                next_fetch_sec = self.calculate_next_fetch_time(time.time())
+                if next_fetch_sec > 0:
+                    # Countdown ETAs during sleep
+                    sleep_interval = 1.0  # Check every second
+                    slept = 0.0
+                    while slept < next_fetch_sec:
+                        time.sleep(sleep_interval)
+                        slept += sleep_interval
+                        # Countdown ETAs by the sleep interval
+                        self.state.countdown_etas(int(sleep_interval))
+                else:
+                    # Immediate fetch needed, don't sleep
+                    pass
             except KeyboardInterrupt:
                 logging.info("Exiting...")
                 break
             except Exception as e:
                 logging.exception("Unexpected error: %s", e)
-                time.sleep(self.config["WATCHLIST_REFRESH_SECONDS"])
+                time.sleep(1)
 

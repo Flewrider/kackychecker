@@ -52,10 +52,14 @@ class KackyWatcherGUI:
         self.watcher: Optional[KackyWatcher] = None
         self.watcher_thread: Optional[threading.Thread] = None
         self.running = False
+        self.immediate_fetch_event = threading.Event()  # Signal to trigger immediate fetch
         
         # Current state for display
         self.live_maps: List[int] = []
         self.tracked_lines: List[Tuple[int, str]] = []
+        self.last_fetch_timestamp: float = 0.0  # Timestamp of last fetch for countdown calculation
+        self.last_countdown_update: float = 0.0  # Timestamp of last countdown update
+        self.countdown_timer_id: Optional[str] = None  # ID of countdown timer
         
         # Map checkbox variables and row widgets (map_number -> (tracking_var, finished_var, row_frame))
         self.tracking_vars: dict[int, tk.BooleanVar] = {}
@@ -72,6 +76,8 @@ class KackyWatcherGUI:
             
             # Start watcher after a short delay to ensure GUI is fully rendered
             self.root.after(100, self.start_watcher)
+            # Start countdown timer
+            self.root.after(200, self.start_countdown_timer)
             print("GUI initialization complete")
         except Exception as e:
             import traceback
@@ -297,8 +303,20 @@ class KackyWatcherGUI:
         
         # Update watcher if tracking changed
         if checkbox_type == "tracking" and self.watcher:
-            self.watcher.watched = get_tracking_maps(self.status_file)
-            self.watcher.watchlist_added = True
+            # Update watched set directly from checkbox states (don't wait for file save)
+            new_tracking = set()
+            for map_num, var in self.tracking_vars.items():
+                if var.get():
+                    new_tracking.add(map_num)
+            
+            # Only trigger fetch if this is actually a change (map added or removed)
+            if new_tracking != self.watcher.watched:
+                self.watcher.watched = new_tracking
+                self.watcher.watchlist_added = True
+                # Trigger immediate fetch
+                self.immediate_fetch_event.set()
+                # Force display refresh to show new map immediately (even if no ETA yet)
+                self.root.after(50, self._refresh_display)
     
     def load_map_status(self) -> None:
         """Load map status from JSON and populate the list."""
@@ -364,36 +382,121 @@ class KackyWatcherGUI:
         """Update output display (called on main thread)."""
         self.live_maps = live_maps
         self.tracked_lines = tracked_lines
+        # Force refresh to ensure new maps appear immediately
+        self._refresh_display()
+    
+    def _refresh_display(self) -> None:
+        """Refresh the display with current countdown values."""
+        now_ts = time.time()
         
         self.output_text.config(state=tk.NORMAL)
         self.output_text.delete("1.0", tk.END)
         
         # Format live section
-        if live_maps:
-            self.output_text.insert(tk.END, "Live:\n", "live_header")
-            for mn in live_maps:
-                # Get servers and remaining time from watcher state
-                servers = []
-                remaining_sec = 0
-                if self.watcher and hasattr(self.watcher, 'state'):
+        if self.watcher and hasattr(self.watcher, 'state'):
+            # Get watched maps from checkbox states (source of truth)
+            watched_for_live = set()
+            if hasattr(self, 'tracking_vars'):
+                for map_num, var in self.tracking_vars.items():
+                    if var.get():
+                        watched_for_live.add(map_num)
+            else:
+                watched_for_live = self.watcher.watched if self.watcher else set()
+            
+            live_summary = self.watcher.state.get_live_summary(
+                watched_for_live,
+                set(self.live_maps),
+                now_ts
+            )
+            
+            if live_summary:
+                self.output_text.insert(tk.END, "Live:\n", "live_header")
+                for mn in live_summary:
+                    # Get servers and remaining time from watcher state
                     servers = sorted(self.watcher.state.live_servers_by_map.get(mn, set()))
+                    remaining_sec = 0
                     if mn in self.watcher.state.live_until_by_map:
-                        remaining_sec = max(0, int(self.watcher.state.live_until_by_map[mn] - time.time()))
-                
-                remaining_str = f" ({remaining_sec//60}:{remaining_sec%60:02d} remaining)" if remaining_sec > 0 else ""
-                if servers:
-                    self.output_text.insert(tk.END, f"- {mn} on {', '.join(servers)}{remaining_str}\n")
-                else:
-                    self.output_text.insert(tk.END, f"- {mn}{remaining_str}\n")
+                        remaining_sec = max(0, int(self.watcher.state.live_until_by_map[mn] - now_ts))
+                    
+                    remaining_str = f" ({remaining_sec//60}:{remaining_sec%60:02d} remaining)" if remaining_sec > 0 else ""
+                    if servers:
+                        self.output_text.insert(tk.END, f"- {mn} on {', '.join(servers)}{remaining_str}\n")
+                    else:
+                        self.output_text.insert(tk.END, f"- {mn}{remaining_str}\n")
+                self.output_text.insert(tk.END, "\n")
+            else:
+                self.output_text.insert(tk.END, "Live:\n(none)\n\n")
+        elif self.live_maps:
+            self.output_text.insert(tk.END, "Live:\n", "live_header")
+            for mn in self.live_maps:
+                self.output_text.insert(tk.END, f"- {mn}\n")
             self.output_text.insert(tk.END, "\n")
         else:
             self.output_text.insert(tk.END, "Live:\n(none)\n\n")
         
         # Format tracked section
         self.output_text.insert(tk.END, "Tracked:\n", "tracked_header")
-        if tracked_lines:
-            # Sort by ETA (unknowns last)
-            for _, line in sorted(tracked_lines, key=lambda x: x[0]):
+        if self.watcher and hasattr(self.watcher, 'state'):
+            tracked_display_lines = []
+            BIG = 10**9
+            
+            # Get watched maps from checkbox states (source of truth) or watcher as fallback
+            watched = set()
+            if hasattr(self, 'tracking_vars'):
+                # Use checkbox states as source of truth
+                for map_num, var in self.tracking_vars.items():
+                    if var.get():
+                        watched.add(map_num)
+            else:
+                # Fallback to watcher's watched set
+                watched = self.watcher.watched if self.watcher else set()
+            
+            live_set = set(self.live_maps) if hasattr(self, 'live_maps') else set()
+            if self.watcher and hasattr(self.watcher, 'state'):
+                live_set = set(self.watcher.state.get_live_summary(watched, set(), now_ts))
+            
+            for mn in sorted(watched):
+                # Check single ETA for non-live maps
+                if mn not in live_set:
+                    eta_sec = BIG
+                    line = f"- {mn} will be live in unknown"
+                    
+                    # Check single ETA
+                    if mn in self.watcher.state.eta_seconds_by_map:
+                        eta_sec = self.watcher.state.eta_seconds_by_map[mn]
+                        srv = self.watcher.state.server_by_map.get(mn, "")
+                        if srv:
+                            line = f"- {mn} will be live in {eta_sec//60}:{eta_sec%60:02d} on {srv}"
+                        else:
+                            line = f"- {mn} will be live in {eta_sec//60}:{eta_sec%60:02d}"
+                    
+                    # Check upcoming servers
+                    if mn in self.watcher.state.upcoming_by_map:
+                        for s, sec in self.watcher.state.upcoming_by_map[mn]:
+                            if sec < eta_sec:
+                                eta_sec = sec
+                                if s:
+                                    line = f"- {mn} will be live in {sec//60}:{sec%60:02d} on {s}"
+                                else:
+                                    line = f"- {mn} will be live in {sec//60}:{sec%60:02d}"
+                    
+                    tracked_display_lines.append((eta_sec, line))
+                
+                # For live maps, also show upcoming servers (different server, scheduled later)
+                if mn in live_set and mn in self.watcher.state.upcoming_by_map:
+                    for s, sec in self.watcher.state.upcoming_by_map[mn]:
+                        if sec > 0:  # Only show if there's an actual ETA
+                            tracked_display_lines.append((sec, f"- {mn} will be live in {sec//60}:{sec%60:02d} on {s}"))
+            
+            # Sort by ETA
+            for _, line in sorted(tracked_display_lines, key=lambda x: x[0]):
+                self.output_text.insert(tk.END, f"{line}\n")
+            
+            if not tracked_display_lines:
+                self.output_text.insert(tk.END, "(none)\n")
+        elif self.tracked_lines:
+            # Fallback to stored tracked_lines if watcher not available
+            for _, line in sorted(self.tracked_lines, key=lambda x: x[0]):
                 self.output_text.insert(tk.END, f"{line}\n")
         else:
             self.output_text.insert(tk.END, "(none)\n")
@@ -405,6 +508,33 @@ class KackyWatcherGUI:
         self.output_text.config(state=tk.DISABLED)
         # Auto-scroll to top
         self.output_text.see("1.0")
+    
+    def start_countdown_timer(self) -> None:
+        """Start the countdown timer that updates display every second."""
+        if self.countdown_timer_id:
+            self.root.after_cancel(self.countdown_timer_id)
+        
+        def countdown_update():
+            """Update display with current countdown values."""
+            if self.watcher:
+                # Update ETAs in state by counting down by 1 second since last update
+                now = time.time()
+                if self.last_countdown_update > 0:
+                    elapsed = now - self.last_countdown_update
+                    if elapsed >= 1.0:
+                        # Countdown by approximately 1 second
+                        self.watcher.state.countdown_etas(1)
+                        self.last_countdown_update = now
+                else:
+                    self.last_countdown_update = now
+            
+            self._refresh_display()
+            
+            # Schedule next update
+            self.countdown_timer_id = self.root.after(1000, countdown_update)
+        
+        # Start the timer
+        self.countdown_timer_id = self.root.after(1000, countdown_update)
     
     def start_watcher(self) -> None:
         """Start the watcher in a separate thread."""
@@ -424,12 +554,30 @@ class KackyWatcherGUI:
             # Override run to use poll_once in a loop we can control
             while self.running:
                 try:
+                    # Check if immediate fetch is requested
+                    immediate_fetch = self.immediate_fetch_event.is_set()
+                    if immediate_fetch:
+                        self.immediate_fetch_event.clear()
+                    
                     self.watcher.poll_once()
-                    sleep_sec = max(1, self.config["WATCHLIST_REFRESH_SECONDS"])
-                    time.sleep(sleep_sec)
+                    self.last_fetch_timestamp = time.time()
+                    self.last_countdown_update = time.time()  # Reset countdown timer on fetch
+                    
+                    # Calculate next fetch time dynamically
+                    next_fetch_sec = self.watcher.calculate_next_fetch_time(time.time())
+                    if next_fetch_sec > 0:
+                        # Sleep in smaller intervals to allow interruption
+                        sleep_interval = 0.5  # Check every 0.5 seconds
+                        slept = 0.0
+                        while slept < next_fetch_sec and self.running and not self.immediate_fetch_event.is_set():
+                            time.sleep(sleep_interval)
+                            slept += sleep_interval
+                    else:
+                        # If no fetch time calculated, use minimal sleep
+                        time.sleep(0.5)
                 except Exception as e:
                     self.root.after(0, lambda: self.update_status(f"Watcher error: {e}"))
-                    time.sleep(self.config["WATCHLIST_REFRESH_SECONDS"])
+                    time.sleep(1)
         
         self.watcher_thread = threading.Thread(target=watcher_loop, daemon=True)
         self.watcher_thread.start()
