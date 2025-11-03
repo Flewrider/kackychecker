@@ -32,7 +32,7 @@ class KackyWatcher:
         Initialize watcher.
         
         Args:
-            config: Configuration dictionary (if None, loads from .env)
+            config: Configuration dictionary (if None, loads from settings.json)
             on_status_update: Callback(status_message: str) for status updates
             on_live_notification: Callback(map_number: int, server: str) for live notifications
             on_summary_update: Callback(live_maps: List[int], tracked_lines: List[tuple[int, str]]) for summary
@@ -56,7 +56,7 @@ class KackyWatcher:
             logging.warning("No maps are being tracked. Check maps in the GUI to start tracking.")
         
         logging.info("Watching %d map(s): %s", len(self.watched), ", ".join(map(str, sorted(self.watched))) if self.watched else "<none>")
-        logging.info("Polling https://kacky.gg/schedule every %ss", self.config["CHECK_INTERVAL_SECONDS"])
+        logging.info("Using dynamic polling based on map ETAs and live windows")
     
     def reload_status(self) -> bool:
         """

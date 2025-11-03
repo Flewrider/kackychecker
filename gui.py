@@ -9,11 +9,20 @@ import time
 from typing import List, Set, Tuple, Optional, Dict, Any
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, messagebox
 
 from config import load_config, setup_logging
 from watcher_core import KackyWatcher
 from map_status_manager import save_map_status, get_tracking_maps, get_finished_maps
+from settings_manager import load_settings, save_settings, get_default_settings
+
+# Windows notifications
+try:
+    from win10toast import ToastNotifier
+    HAS_NOTIFICATIONS = True
+except ImportError:
+    HAS_NOTIFICATIONS = False
+    ToastNotifier = None
 
 
 class KackyWatcherGUI:
@@ -33,6 +42,9 @@ class KackyWatcherGUI:
         print("Setting window properties...")
         self.root.title("Kacky Watcher")
         self.root.geometry("1200x700")
+        
+        # Initialize Windows notifications
+        self.toast = ToastNotifier() if HAS_NOTIFICATIONS else None
         
         print("Loading config...")
         self.config = load_config()
@@ -81,6 +93,15 @@ class KackyWatcherGUI:
             print("Setting up UI...")
             self.setup_ui()
             print("UI setup complete, loading map status...")
+            
+            # Create menu bar after UI setup
+            menubar = tk.Menu(self.root)
+            self.root.config(menu=menubar)
+            
+            # Settings menu
+            settings_menu = tk.Menu(menubar, tearoff=0)
+            menubar.add_cascade(label="Settings", menu=settings_menu)
+            settings_menu.add_command(label="Configure...", command=self.show_settings_dialog)
             self.load_map_status()
             print("Map status loaded, scheduling watcher start...")
             
@@ -556,6 +577,15 @@ class KackyWatcherGUI:
         server_text = f" on {server}" if server else ""
         self.update_status(f"🎉 Map #{map_number} is LIVE{server_text}!")
         
+        # Show Windows toast notification if enabled
+        if self.config.get("ENABLE_NOTIFICATIONS", True) and self.toast:
+            try:
+                title = f"Map #{map_number} is LIVE!"
+                message = f"Map #{map_number} is now live{server_text}"
+                self.toast.show_toast(title, message, duration=5, threaded=True)
+            except Exception as e:
+                logging.warning(f"Failed to show notification: {e}")
+        
         # Schedule a refetch after ~1 minute to handle map transition period
         # Cancel any existing timer for this map
         if map_number in self.transition_refetch_timers:
@@ -844,6 +874,149 @@ class KackyWatcherGUI:
         if self.watcher_thread:
             self.watcher_thread.join(timeout=2.0)
         self.update_status("Watcher stopped")
+    
+    def show_settings_dialog(self) -> None:
+        """Show settings configuration dialog."""
+        settings = load_settings()
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Settings")
+        dialog.geometry("500x600")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Center the dialog
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (dialog.winfo_width() // 2)
+        y = (dialog.winfo_screenheight() // 2) - (dialog.winfo_height() // 2)
+        dialog.geometry(f"+{x}+{y}")
+        
+        # Variables for settings
+        vars_frame = {}
+        
+        # Create scrollable frame
+        canvas = tk.Canvas(dialog)
+        scrollbar = ttk.Scrollbar(dialog, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Settings fields
+        row = 0
+        ttk.Label(scrollable_frame, text="Log Level:", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
+        log_level_var = tk.StringVar(value=settings.get("LOG_LEVEL", "INFO"))
+        log_level_combo = ttk.Combobox(scrollable_frame, textvariable=log_level_var, values=["DEBUG", "INFO", "WARNING", "ERROR"], state="readonly", width=20)
+        log_level_combo.grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
+        vars_frame["LOG_LEVEL"] = log_level_var
+        row += 1
+        
+        ttk.Label(scrollable_frame, text="Enable Browser Fallback:", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
+        enable_browser_var = tk.BooleanVar(value=settings.get("ENABLE_BROWSER", True))
+        ttk.Checkbutton(scrollable_frame, variable=enable_browser_var).grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
+        vars_frame["ENABLE_BROWSER"] = enable_browser_var
+        row += 1
+        
+        ttk.Label(scrollable_frame, text="Enable Notifications:", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
+        enable_notif_var = tk.BooleanVar(value=settings.get("ENABLE_NOTIFICATIONS", True))
+        notif_cb = ttk.Checkbutton(scrollable_frame, variable=enable_notif_var)
+        notif_cb.grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
+        if not HAS_NOTIFICATIONS:
+            notif_cb.config(state=tk.DISABLED)
+            ttk.Label(scrollable_frame, text="(win10toast not installed)", font=("Arial", 8), foreground="gray").grid(row=row, column=2, sticky=tk.W, padx=5)
+        vars_frame["ENABLE_NOTIFICATIONS"] = enable_notif_var
+        row += 1
+        
+        ttk.Label(scrollable_frame, text="Request Timeout (seconds):", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
+        timeout_var = tk.IntVar(value=settings.get("REQUEST_TIMEOUT_SECONDS", 10))
+        ttk.Spinbox(scrollable_frame, from_=1, to=60, textvariable=timeout_var, width=20).grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
+        vars_frame["REQUEST_TIMEOUT_SECONDS"] = timeout_var
+        row += 1
+        
+        ttk.Label(scrollable_frame, text="ETA Fetch Threshold (seconds):", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
+        eta_threshold_var = tk.IntVar(value=settings.get("ETA_FETCH_THRESHOLD_SECONDS", 60))
+        ttk.Spinbox(scrollable_frame, from_=10, to=300, textvariable=eta_threshold_var, width=20).grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
+        vars_frame["ETA_FETCH_THRESHOLD_SECONDS"] = eta_threshold_var
+        row += 1
+        
+        ttk.Label(scrollable_frame, text="Live Duration (seconds):", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
+        live_duration_var = tk.IntVar(value=settings.get("LIVE_DURATION_SECONDS", 600))
+        ttk.Spinbox(scrollable_frame, from_=60, to=3600, textvariable=live_duration_var, width=20).grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
+        vars_frame["LIVE_DURATION_SECONDS"] = live_duration_var
+        row += 1
+        
+        ttk.Label(scrollable_frame, text="Watchlist Refresh (seconds):", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
+        watchlist_refresh_var = tk.IntVar(value=settings.get("WATCHLIST_REFRESH_SECONDS", 20))
+        ttk.Spinbox(scrollable_frame, from_=5, to=120, textvariable=watchlist_refresh_var, width=20).grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
+        vars_frame["WATCHLIST_REFRESH_SECONDS"] = watchlist_refresh_var
+        row += 1
+        
+        ttk.Label(scrollable_frame, text="ETA Margin (seconds):", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
+        eta_margin_var = tk.IntVar(value=settings.get("ETA_MARGIN_SECONDS", 2))
+        ttk.Spinbox(scrollable_frame, from_=0, to=10, textvariable=eta_margin_var, width=20).grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
+        vars_frame["ETA_MARGIN_SECONDS"] = eta_margin_var
+        row += 1
+        
+        # Buttons
+        button_frame = ttk.Frame(scrollable_frame)
+        button_frame.grid(row=row, column=0, columnspan=2, pady=20)
+        
+        def on_save():
+            """Save settings and reload config."""
+            new_settings = {}
+            for key, var in vars_frame.items():
+                if isinstance(var, tk.BooleanVar):
+                    new_settings[key] = var.get()
+                elif isinstance(var, tk.IntVar):
+                    new_settings[key] = var.get()
+                elif isinstance(var, tk.StringVar):
+                    new_settings[key] = var.get()
+            
+            # Preserve USER_AGENT
+            new_settings["USER_AGENT"] = settings.get("USER_AGENT", get_default_settings()["USER_AGENT"])
+            
+            if save_settings(new_settings):
+                # Reload config
+                self.config = load_config()
+                # Update logging level
+                setup_logging(self.config["LOG_LEVEL"])
+                # Update toast notification availability
+                if self.config.get("ENABLE_NOTIFICATIONS", True) and HAS_NOTIFICATIONS:
+                    self.toast = ToastNotifier() if not self.toast else self.toast
+                else:
+                    self.toast = None
+                
+                messagebox.showinfo("Settings", "Settings saved successfully!\nSome changes may require restarting the watcher.")
+                dialog.destroy()
+            else:
+                messagebox.showerror("Error", "Failed to save settings file.")
+        
+        def on_reset():
+            """Reset to defaults."""
+            if messagebox.askyesno("Reset Settings", "Reset all settings to defaults?"):
+                defaults = get_default_settings()
+                for key, var in vars_frame.items():
+                    if key in defaults:
+                        if isinstance(var, tk.BooleanVar):
+                            var.set(defaults[key])
+                        elif isinstance(var, tk.IntVar):
+                            var.set(defaults[key])
+                        elif isinstance(var, tk.StringVar):
+                            var.set(defaults[key])
+        
+        ttk.Button(button_frame, text="Save", command=on_save).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Reset to Defaults", command=on_reset).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Focus on dialog
+        dialog.focus_set()
     
     def on_closing(self) -> None:
         """Handle window closing."""
