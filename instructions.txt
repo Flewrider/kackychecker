@@ -1,0 +1,44 @@
+Windows usage (PowerShell 7)
+
+1) Install Python 3.11+
+   - Verify: python --version
+
+2) Create and activate a virtual environment
+   - python -m venv .venv
+   - .\\.venv\\Scripts\\Activate.ps1
+
+3) Install dependencies
+   - pip install -r requirements.txt
+   - (optional) enable headless browser fallback:
+     - python -m playwright install
+
+4) Create your .env file
+   - Copy env.example to .env and adjust values if desired
+     - Copy-Item -Path env.example -Destination .env -Force
+     - (or) cp env.example .env
+   - Options in .env
+     - CHECK_INTERVAL_SECONDS=20
+     - REQUEST_TIMEOUT_SECONDS=10
+     - USER_AGENT=KackyWatcher/1.0 (+https://kacky.gg/schedule)
+     - LOG_LEVEL=INFO
+     - ENABLE_BROWSER=0   # set to 1 to use the browser fallback
+
+5) Edit your watchlist
+   - Open watchlist.txt and list the map numbers you care about
+   - One number per line, e.g.
+     379
+     385
+
+6) Run the watcher
+   - python .\\kacky_watcher.py
+   - Leave the window open; it will poll and print when a watched map goes LIVE
+   - For more detail, set LOG_LEVEL=DEBUG in .env
+
+7) Stop the watcher
+   - Press Ctrl+C
+
+Notes
+- Source page: https://kacky.gg/schedule
+- The script looks for rows where the left title starts with the map number (e.g., "379 - ...") and the right side contains "LIVE".
+- If multiple duplicate rows exist for a map (different servers), the script notifies once when it first becomes live and suppresses repeats until it goes offline again.
+
