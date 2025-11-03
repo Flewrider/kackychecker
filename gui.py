@@ -2,6 +2,7 @@
 GUI module for Kacky Watcher using tkinter.
 Provides split-pane interface with map list (tracking/finished checkboxes) and live/tracked output.
 """
+import logging
 import threading
 import time
 from typing import List, Set, Tuple, Optional
@@ -53,6 +54,7 @@ class KackyWatcherGUI:
         self.watcher_thread: Optional[threading.Thread] = None
         self.running = False
         self.immediate_fetch_event = threading.Event()  # Signal to trigger immediate fetch
+        self.transition_refetch_timers: dict[int, str] = {}  # Map number -> timer ID for transition refetches
         
         # Current state for display
         self.live_maps: List[int] = []
@@ -100,12 +102,16 @@ class KackyWatcherGUI:
         header_frame.pack(fill=tk.X, padx=5, pady=(5, 2))
         ttk.Label(header_frame, text="Maps", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
         
-        # Column headers
+        # Column headers - use grid for better alignment
         header_row = ttk.Frame(left_frame)
         header_row.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(header_row, text="Map", width=8, font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=2)
-        ttk.Label(header_row, text="Tracking", width=10, font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=2)
-        ttk.Label(header_row, text="Finished", width=10, font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=2)
+        ttk.Label(header_row, text="Map", width=8, font=("Arial", 9, "bold")).grid(row=0, column=0, padx=2)
+        ttk.Label(header_row, text="Tracking", width=10, font=("Arial", 9, "bold")).grid(row=0, column=1, padx=2)
+        ttk.Label(header_row, text="Finished", width=10, font=("Arial", 9, "bold")).grid(row=0, column=2, padx=2)
+        # Configure grid columns to not expand
+        header_row.grid_columnconfigure(0, weight=0)
+        header_row.grid_columnconfigure(1, weight=0)
+        header_row.grid_columnconfigure(2, weight=0)
         
         # Scrollable frame for map list
         canvas_frame = ttk.Frame(left_frame)
@@ -135,8 +141,18 @@ class KackyWatcherGUI:
         def on_mousewheel(event):
             canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         
-        # Only bind mouse wheel to this canvas, not all widgets
+        # Bind mouse wheel to canvas_frame and all child widgets
+        def bind_mousewheel(widget):
+            widget.bind("<MouseWheel>", on_mousewheel)
+            for child in widget.winfo_children():
+                bind_mousewheel(child)
+        
+        # Bind to canvas_frame and propagate to all children
         canvas.bind("<MouseWheel>", on_mousewheel)
+        canvas_frame.bind("<MouseWheel>", on_mousewheel)
+        self.map_container.bind("<MouseWheel>", on_mousewheel)
+        # Also bind to all existing and future children
+        bind_mousewheel(self.map_container)
         
         # Store canvas reference
         self.map_canvas = canvas
@@ -176,18 +192,31 @@ class KackyWatcherGUI:
         
         try:
             print(f"Populating map list ({self.map_range_start}-{self.map_range_end})...")
-            # Clear existing rows and checkbox variables
+            # Clear existing rows but preserve checkbox variable values
             for widget in self.map_container.winfo_children():
                 widget.destroy()
             
             self.map_rows.clear()
-            # Clear checkbox variables to start fresh
+            # Preserve checkbox variable values before reading from file
+            # This ensures UI state is preserved during repopulation
+            preserved_tracking = {mn: var.get() for mn, var in self.tracking_vars.items()}
+            preserved_finished = {mn: var.get() for mn, var in self.finished_vars.items()}
+            
+            # Get current status from file
+            tracking_from_file = get_tracking_maps(self.status_file)
+            finished_from_file = get_finished_maps(self.status_file)
+            
+            # Merge: use preserved values if available, otherwise use file values
+            # This ensures checkbox states are preserved even if file hasn't been saved yet
+            tracking = tracking_from_file.copy()
+            tracking.update({mn for mn, val in preserved_tracking.items() if val})
+            
+            finished = finished_from_file.copy()
+            finished.update({mn for mn, val in preserved_finished.items() if val})
+            
+            # Clear checkbox variables to rebuild them
             self.tracking_vars.clear()
             self.finished_vars.clear()
-            
-            # Get current status
-            tracking = get_tracking_maps(self.status_file)
-            finished = get_finished_maps(self.status_file)
             
             # Separate finished and unfinished maps
             unfinished_maps = []
@@ -213,7 +242,14 @@ class KackyWatcherGUI:
             print(f"Adding {len(finished_maps)} finished maps...")
             # Add finished maps at bottom (green background)
             for map_num in finished_maps:
-                self.add_map_row(map_num, map_num in tracking, map_num in finished, is_finished=True)
+                self.add_map_row(map_num, map_num in tracking, map_num in finished, is_finished_flag=True)
+            
+            # Rebind mouse wheel to new widgets
+            def bind_mousewheel(widget):
+                widget.bind("<MouseWheel>", lambda e: self.map_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+                for child in widget.winfo_children():
+                    bind_mousewheel(child)
+            bind_mousewheel(self.map_container)
             
             print("Map list population complete")
         finally:
@@ -254,26 +290,32 @@ class KackyWatcherGUI:
             row_frame = ttk.Frame(self.map_container)
             bg_color = None
         
-        row_frame.pack(fill=tk.X, pady=1)
+        # Use grid layout for consistent alignment regardless of window size
+        row_frame.grid_columnconfigure(0, weight=0)
+        row_frame.grid_columnconfigure(1, weight=0)
+        row_frame.grid_columnconfigure(2, weight=0)
         
         # Map number label
         if bg_color:
             map_label = tk.Label(row_frame, text=str(map_num), width=8, anchor=tk.CENTER, bg=bg_color)
         else:
             map_label = ttk.Label(row_frame, text=str(map_num), width=8, anchor=tk.CENTER)
-        map_label.pack(side=tk.LEFT, padx=2)
+        map_label.grid(row=0, column=0, padx=2, sticky=tk.W)
         
-        # Tracking checkbox - create without command first, set value, then add command
+        # Tracking checkbox - use grid for alignment
         tracking_cb = ttk.Checkbutton(row_frame, variable=self.tracking_vars[map_num])
-        tracking_cb.pack(side=tk.LEFT, padx=2)
+        tracking_cb.grid(row=0, column=1, padx=2, sticky=tk.W)
         # Now set the command after the variable is set
         tracking_cb.configure(command=lambda mn=map_num: self.on_checkbox_change(mn, "tracking"))
         
-        # Finished checkbox - create without command first, set value, then add command
+        # Finished checkbox - use grid for alignment
         finished_cb = ttk.Checkbutton(row_frame, variable=self.finished_vars[map_num])
-        finished_cb.pack(side=tk.LEFT, padx=2)
+        finished_cb.grid(row=0, column=2, padx=2, sticky=tk.W)
         # Now set the command after the variable is set
         finished_cb.configure(command=lambda mn=map_num: self.on_checkbox_change(mn, "finished"))
+        
+        # Pack the row frame itself
+        row_frame.pack(fill=tk.X, pady=1)
         
         self.map_rows[map_num] = row_frame
     
@@ -293,10 +335,12 @@ class KackyWatcherGUI:
         if self.save_timer:
             self.root.after_cancel(self.save_timer)
         
-        # If finished checkbox was checked, refresh the list to move it to bottom
+        # If finished checkbox was checked, save immediately and refresh the list to move it to bottom
         if checkbox_type == "finished":
-            # Schedule repopulation after a short delay to avoid immediate re-trigger
-            self.root.after(50, self.populate_map_list)
+            # Save immediately so repopulate can read the updated state
+            self.save_map_status()
+            # Schedule repopulation after a short delay to allow file write to complete
+            self.root.after(100, self.populate_map_list)
         
         # Schedule save after 0.5 seconds of no changes
         self.save_timer = self.root.after(500, self.save_map_status)
@@ -366,6 +410,25 @@ class KackyWatcherGUI:
         """Show live notification in GUI (called on main thread)."""
         server_text = f" on {server}" if server else ""
         self.update_status(f"🎉 Map #{map_number} is LIVE{server_text}!")
+        
+        # Schedule a refetch after ~1 minute to handle map transition period
+        # Cancel any existing timer for this map
+        if map_number in self.transition_refetch_timers:
+            self.root.after_cancel(self.transition_refetch_timers[map_number])
+        
+        # Schedule refetch after 80 seconds
+        def transition_refetch():
+            """Trigger fetch after map transition period."""
+            if self.watcher and self.running:
+                logging.info("Fetching schedule (reason: map transition period - map #%s went live ~1 min ago)", map_number)
+                self.update_status(f"Refetching after map #{map_number} transition...")
+                self.immediate_fetch_event.set()
+            # Clean up timer reference
+            if map_number in self.transition_refetch_timers:
+                del self.transition_refetch_timers[map_number]
+        
+        timer_id = self.root.after(80000, transition_refetch)
+        self.transition_refetch_timers[map_number] = timer_id
     
     def on_summary_update(self, live_maps: List[int], tracked_lines: List[Tuple[int, str]]) -> None:
         """
