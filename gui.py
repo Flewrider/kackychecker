@@ -63,8 +63,6 @@ class KackyWatcherGUI:
         self.refresh_throttle_ms: float = 50.0  # Minimum ms between refreshes
         self.pending_refresh: bool = False  # Flag to indicate refresh is needed
         self.refresh_timer_id: Optional[str] = None  # ID of pending refresh timer
-        self.is_resizing: bool = False  # Flag to track if window is being resized
-        self.resize_timer_id: Optional[str] = None  # Timer to detect end of resize
         
         # Current state for display
         self.live_maps: List[int] = []
@@ -102,10 +100,6 @@ class KackyWatcherGUI:
         # Main container with split pane
         main_paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Bind resize events to pause refreshes during resize
-        self.root.bind("<Configure>", self._on_resize_start)
-        main_paned.bind("<Configure>", self._on_resize_start)
         
         # Left pane: Map list with checkboxes (with border)
         left_frame = tk.Frame(main_paned, relief=tk.SOLID, borderwidth=1, bg="black")
@@ -156,7 +150,6 @@ class KackyWatcherGUI:
         # Create resizable paned window for unfinished and finished sections
         map_paned = ttk.PanedWindow(left_inner, orient=tk.VERTICAL)
         map_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        map_paned.bind("<Configure>", self._on_resize_start)
         
         # Helper function to create scrollable frame
         def create_scrollable_frame(parent, label_text=None):
@@ -632,45 +625,8 @@ class KackyWatcherGUI:
         self.last_refresh_time = time.time()
         self._refresh_display()
     
-    def _on_resize_start(self, event=None) -> None:
-        """Handle resize start - pause refreshes during resize."""
-        # Only care about actual resize events (not just any configure)
-        if event and event.widget == self.root:
-            # Window resize - check if size actually changed
-            if not hasattr(self, '_last_window_size'):
-                self._last_window_size = (self.root.winfo_width(), self.root.winfo_height())
-            current_size = (self.root.winfo_width(), self.root.winfo_height())
-            if current_size == self._last_window_size:
-                return  # Not actually resizing
-            self._last_window_size = current_size
-        
-        self.is_resizing = True
-        # Cancel any pending refresh
-        if self.refresh_timer_id:
-            self.root.after_cancel(self.refresh_timer_id)
-            self.refresh_timer_id = None
-        self.pending_refresh = False
-        
-        # Cancel existing resize end timer
-        if self.resize_timer_id:
-            self.root.after_cancel(self.resize_timer_id)
-        
-        # Schedule resize end detection (after 150ms of no resize events)
-        self.resize_timer_id = self.root.after(150, self._on_resize_end)
-    
-    def _on_resize_end(self) -> None:
-        """Handle resize end - resume refreshes."""
-        self.is_resizing = False
-        # Schedule a refresh now that resize is done
-        if not self.pending_refresh:
-            self._schedule_refresh()
-    
     def _refresh_display(self) -> None:
         """Refresh the display with current countdown values (called on main thread)."""
-        # Skip refresh if currently resizing
-        if self.is_resizing:
-            return
-        
         now_ts = time.time()
         
         # Build content as string first (much faster than multiple inserts)
