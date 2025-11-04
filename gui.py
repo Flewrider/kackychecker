@@ -16,6 +16,7 @@ from watcher_core import KackyWatcher
 from map_status_manager import save_map_status, get_tracking_maps, get_finished_maps
 from settings_manager import load_settings, save_settings, get_default_settings
 from path_utils import get_map_status_file
+from playwright_installer import check_browsers_installed, install_browsers_with_progress
 
 # Windows notifications
 try:
@@ -68,7 +69,6 @@ class KackyWatcherGUI:
         self.watcher_thread: Optional[threading.Thread] = None
         self.running = False
         self.immediate_fetch_event = threading.Event()  # Signal to trigger immediate fetch
-        self.transition_refetch_timers: dict[int, list[str]] = {}  # Map number -> list of timer IDs for transition refetches
         
         # Queue for thread-safe GUI updates (decouple watcher from GUI rendering)
         self.update_queue: queue.Queue = queue.Queue(maxsize=100)  # Limit queue size
@@ -106,6 +106,16 @@ class KackyWatcherGUI:
             
             # Initialize default files on first run
             self.initialize_default_files()
+            
+            # Ensure browsers path is set (for EXE mode to find system-installed browsers)
+            try:
+                from playwright_installer import _ensure_browsers_path_set
+                _ensure_browsers_path_set()
+            except Exception as e:
+                logging.debug(f"Could not ensure browsers path: {e}")
+            
+            # Check and install Playwright browsers if needed
+            self.check_and_install_playwright()
             
             self.load_map_status()
             print("Map status loaded, scheduling watcher start...")
@@ -496,7 +506,7 @@ class KackyWatcherGUI:
         if not os.path.exists(settings_path):
             default_settings = get_default_settings()
             save_settings(default_settings)
-            logging.info("Created default settings.json")
+            logging.debug("Created default settings.json")
         
         # Initialize watchlist.txt if it doesn't exist (empty file with header)
         watchlist_path = get_watchlist_file()
@@ -504,13 +514,153 @@ class KackyWatcherGUI:
             with open(watchlist_path, "w", encoding="utf-8") as f:
                 f.write("# One map number per line. Lines starting with # are comments.\n")
                 f.write("# Examples:\n")
-            logging.info("Created default watchlist.txt")
+            logging.debug("Created default watchlist.txt")
         
         # Initialize map_status.json if it doesn't exist (empty state)
         status_path = get_map_status_file()
         if not os.path.exists(status_path):
             save_map_status(set(), set(), status_path)
-            logging.info("Created default map_status.json")
+            logging.debug("Created default map_status.json")
+    
+    def check_and_install_playwright(self) -> None:
+        """Check if Playwright browsers are installed and install if needed."""
+        # Playwright browsers are required for the application to work
+        # since HTTP requests don't return usable data
+        logging.debug("Checking Playwright browser installation...")
+        try:
+            browsers_installed = check_browsers_installed()
+            logging.debug(f"Browsers installed check result: {browsers_installed}")
+            
+            if not browsers_installed:
+                logging.debug("Playwright browsers not found, showing installation dialog...")
+                
+                # Show dialog - installation is required
+                response = messagebox.askyesno(
+                    "Install Playwright Browsers (Required)",
+                    "Playwright browsers are REQUIRED for this application to work.\n\n"
+                    "The website requires JavaScript rendering, so HTTP requests alone\n"
+                    "cannot gather the schedule data.\n\n"
+                    "The installation will download ~100-200MB and may take a few minutes.\n\n"
+                    "Would you like to install them now?\n\n"
+                    "The application cannot function properly without them.",
+                    icon="warning"
+                )
+                
+                logging.debug(f"User response to installation dialog: {response}")
+                
+                if response:
+                    logging.debug("User chose to install, starting installation thread...")
+                    # Force GUI update immediately (on main thread)
+                    self.update_status("Preparing installation...")
+                    
+                    # Install in a separate thread to avoid blocking GUI
+                    def install_thread():
+                        try:
+                            logging.debug("=== INSTALLATION THREAD STARTED ===")
+                            
+                            def update_status(message: str):
+                                """Update status from background thread - safely schedules on main thread."""
+                                logging.debug(f"Status update: {message}")
+                                # Schedule update on main thread - capture message in default arg for safety
+                                try:
+                                    # Use a closure with default argument to capture the message
+                                    def update_on_main(msg=message):
+                                        try:
+                                            self.update_status(msg)
+                                        except Exception as e:
+                                            logging.error(f"Error updating status: {e}")
+                                    
+                                    self.root.after(0, update_on_main)
+                                except Exception as e:
+                                    logging.error(f"Error scheduling status update: {e}")
+                            
+                            # Initial status update
+                            update_status("Starting Playwright browser installation...")
+                            logging.debug("Calling install_browsers_with_progress...")
+                            
+                            success, error = install_browsers_with_progress(update_status)
+                            
+                            logging.debug(f"=== Installation result: success={success}, error={error} ===")
+                            
+                            if success:
+                                logging.debug("Installation succeeded, verifying...")
+                                # Re-check browsers after installation
+                                import time
+                                time.sleep(2)  # Give installation time to complete
+                                browsers_now_installed = check_browsers_installed()
+                                logging.debug(f"Re-check after installation: {browsers_now_installed}")
+                                
+                                def show_success(verified=browsers_now_installed):
+                                    try:
+                                        if verified:
+                                            messagebox.showinfo(
+                                                "Installation Complete",
+                                                "Playwright browsers installed successfully!\n"
+                                                "The application can now fetch schedule data."
+                                            )
+                                        else:
+                                            messagebox.showwarning(
+                                                "Installation Complete",
+                                                "Playwright browsers installation completed.\n\n"
+                                                "The browsers may not be detected until you restart the application.\n"
+                                                "Please restart the application to use the browser features."
+                                            )
+                                    except Exception as e:
+                                        logging.error(f"Error showing success dialog: {e}")
+                                self.root.after(0, show_success)
+                            else:
+                                error_display = error or "Unknown error occurred"
+                                logging.error(f"Installation failed: {error_display}")
+                                def show_error(err=error_display):
+                                    try:
+                                        messagebox.showerror(
+                                            "Installation Failed",
+                                            f"Failed to install Playwright browsers:\n\n{err}\n\n"
+                                            "The application will not be able to fetch schedule data.\n"
+                                            "Please try installing again or check your internet connection.\n\n"
+                                            "You can also try installing manually:\n"
+                                            "python -m playwright install chromium"
+                                        )
+                                    except Exception as e:
+                                        logging.error(f"Error showing error dialog: {e}")
+                                self.root.after(0, show_error)
+                        except Exception as e:
+                            logging.error(f"=== UNEXPECTED ERROR in install thread: {e} ===", exc_info=True)
+                            import traceback
+                            error_trace = traceback.format_exc()
+                            logging.error(f"Full traceback:\n{error_trace}")
+                            def show_exception_error(err=str(e), trace=error_trace):
+                                try:
+                                    messagebox.showerror(
+                                        "Installation Error",
+                                        f"An unexpected error occurred during installation:\n\n{err}\n\n"
+                                        f"Check logs for details:\n{trace[:500]}"
+                                    )
+                                except Exception as e2:
+                                    logging.error(f"Error showing exception dialog: {e2}")
+                            self.root.after(0, show_exception_error)
+                    
+                    install_thread_obj = threading.Thread(target=install_thread, daemon=False, name="PlaywrightInstaller")
+                    install_thread_obj.start()
+                    logging.debug(f"Installation thread started: {install_thread_obj.name}, alive={install_thread_obj.is_alive()}")
+                else:
+                    logging.warning("User skipped required Playwright browser installation")
+                    messagebox.showwarning(
+                        "Installation Skipped",
+                        "Playwright browsers are REQUIRED for the application to work.\n\n"
+                        "The application will not be able to fetch schedule data without them.\n"
+                        "Please restart the application and install them when prompted."
+                    )
+            else:
+                logging.debug("Playwright browsers are already installed")
+        except Exception as e:
+            logging.warning(f"Error checking/installing Playwright browsers: {e}")
+            # Don't block startup if this fails, but warn the user
+            messagebox.showwarning(
+                "Playwright Check Failed",
+                f"Could not verify Playwright browser installation:\n{e}\n\n"
+                "The application may not function properly."
+            )
     
     def load_map_status(self) -> None:
         """Load map status from JSON and populate the list."""
@@ -607,17 +757,25 @@ class KackyWatcherGUI:
     def _show_live_notification(self, map_number: int, server: str) -> None:
         """Show live notification in GUI (called on main thread from queue processor)."""
         server_text = f" on {server}" if server else ""
+        logging.debug(f"_show_live_notification called for map #{map_number}, server: {server}")
         self.update_status(f"🎉 Map #{map_number} is LIVE{server_text}!")
         
+        # Check notification settings
+        notifications_enabled = self.config.get("ENABLE_NOTIFICATIONS", True)
+        logging.debug(f"Notifications enabled: {notifications_enabled}, HAS_NOTIFICATIONS: {HAS_NOTIFICATIONS}")
+        
         # Show Windows toast notification if enabled
-        if self.config.get("ENABLE_NOTIFICATIONS", True) and HAS_NOTIFICATIONS:
+        if notifications_enabled and HAS_NOTIFICATIONS:
             try:
                 title = f"Map #{map_number} is LIVE!"
                 message = f"Map #{map_number} is now live{server_text}"
+                logging.debug(f"Attempting to show notification: title='{title}', message='{message}'")
+                
                 # Run notification in a separate thread to avoid blocking GUI
                 # Suppress win10toast errors that don't affect functionality
                 def show_notification():
                     try:
+                        logging.debug("Notification thread started")
                         import sys
                         import io
                         # Temporarily suppress stderr to hide win10toast WPARAM errors
@@ -626,61 +784,34 @@ class KackyWatcherGUI:
                         try:
                             # Create new instance in thread to avoid GUI thread conflicts
                             toast = ToastNotifier()
-                            toast.show_toast(title, message, duration=5, threaded=False)
+                            logging.debug("ToastNotifier created, calling show_toast...")
+                            result = toast.show_toast(title, message, duration=5, threaded=False)
+                            logging.debug(f"show_toast returned: {result}")
                         finally:
                             sys.stderr = old_stderr
+                            logging.debug("Notification thread completed")
                     except Exception as e:
-                        # Only log if it's not the known WPARAM error
-                        if "WPARAM" not in str(e) and "classAtom" not in str(e):
+                        # Log all errors for debugging
+                        error_str = str(e)
+                        logging.error(f"Exception in notification thread: {e}", exc_info=True)
+                        # Only suppress known benign errors
+                        if "WPARAM" not in error_str and "classAtom" not in error_str:
                             logging.warning(f"Failed to show notification: {e}")
+                        else:
+                            logging.debug(f"Suppressed known win10toast error: {e}")
                 
-                notification_thread = threading.Thread(target=show_notification, daemon=True)
+                notification_thread = threading.Thread(target=show_notification, daemon=True, name="NotificationThread")
                 notification_thread.start()
+                logging.debug(f"Notification thread started: {notification_thread.name}")
             except Exception as e:
-                logging.warning(f"Failed to start notification thread: {e}")
+                logging.error(f"Failed to start notification thread: {e}", exc_info=True)
+        else:
+            if not notifications_enabled:
+                logging.debug("Notifications disabled in settings")
+            if not HAS_NOTIFICATIONS:
+                logging.debug("win10toast not available (HAS_NOTIFICATIONS=False)")
         
-        # Schedule refetches at 30s and 60s after map goes live to handle transition periods
-        # The website shows both old and new maps briefly during transition
-        # Cancel any existing timers for this map
-        if map_number in self.transition_refetch_timers:
-            for timer_id in self.transition_refetch_timers[map_number]:
-                self.root.after_cancel(timer_id)
-            del self.transition_refetch_timers[map_number]
-        
-        # Store timer IDs for this map (30s and 60s)
-        timer_ids = []
-        
-        def create_refetch_handler(delay_sec: int, timer_id_ref: list):
-            """Create a refetch handler that can clean up its own timer."""
-            def do_refetch():
-                if self.watcher and self.running:
-                    logging.info("Fetching schedule (reason: map transition period - map #%s went live ~%ds ago)", map_number, delay_sec)
-                    self.update_status(f"Refetching after map #{map_number} transition ({delay_sec}s)...")
-                    self.immediate_fetch_event.set()
-                # Clean up timer reference
-                if map_number in self.transition_refetch_timers:
-                    # Remove this timer ID from the list
-                    if timer_id_ref[0] in self.transition_refetch_timers[map_number]:
-                        self.transition_refetch_timers[map_number].remove(timer_id_ref[0])
-                    if not self.transition_refetch_timers[map_number]:
-                        del self.transition_refetch_timers[map_number]
-            return do_refetch
-        
-        # Schedule 30 second refetch
-        timer_id_30_ref = [None]  # Use list to allow modification in closure
-        handler_30 = create_refetch_handler(30, timer_id_30_ref)
-        timer_id_30 = self.root.after(30000, handler_30)
-        timer_id_30_ref[0] = timer_id_30
-        timer_ids.append(timer_id_30)
-        
-        # Schedule 60 second refetch
-        timer_id_60_ref = [None]  # Use list to allow modification in closure
-        handler_60 = create_refetch_handler(60, timer_id_60_ref)
-        timer_id_60 = self.root.after(60000, handler_60)
-        timer_id_60_ref[0] = timer_id_60
-        timer_ids.append(timer_id_60)
-        
-        self.transition_refetch_timers[map_number] = timer_ids
+        # Transition refetches removed - the 5-minute cooldown period handles map transitions
     
     def on_summary_update(self, live_maps: List[int], tracked_lines: List[Tuple[int, str]]) -> None:
         """
@@ -828,6 +959,14 @@ class KackyWatcherGUI:
                                     line = f"- {mn} will be live in {sec//60}:{sec%60:02d} on {s}"
                                 else:
                                     line = f"- {mn} will be live in {sec//60}:{sec%60:02d}"
+                    
+                    # Check if ETA is stuck at 000 (indicating stale data)
+                    if eta_sec == 0 and eta_sec != BIG:
+                        # Check if data is stale (no recent successful fetch)
+                        if hasattr(self.watcher, 'last_successful_fetch_time'):
+                            time_since_success = now_ts - self.watcher.last_successful_fetch_time if self.watcher.last_successful_fetch_time > 0 else float('inf')
+                            if time_since_success > 120:  # More than 2 minutes since last success
+                                line += " ⚠️ (stale data)"
                     
                     tracked_display_lines.append((eta_sec, line))
                 

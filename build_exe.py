@@ -16,10 +16,25 @@ def main():
     # Clean previous builds
     if os.path.exists("build"):
         print("Cleaning build directory...")
-        shutil.rmtree("build")
+        try:
+            shutil.rmtree("build")
+        except PermissionError as e:
+            print(f"Warning: Could not delete build directory: {e}")
+            print("This is usually fine - PyInstaller will handle cleanup.")
+    
     if os.path.exists("dist"):
         print("Cleaning dist directory...")
-        shutil.rmtree("dist")
+        try:
+            shutil.rmtree("dist")
+        except PermissionError as e:
+            print(f"Warning: Could not delete dist directory: {e}")
+            print("The KackyWatcher.exe may be running. Please close it and try again.")
+            print("Alternatively, PyInstaller's --clean flag should handle this.")
+            # Ask user if they want to continue
+            response = input("Continue anyway? (y/n): ").strip().lower()
+            if response != 'y':
+                print("Build cancelled.")
+                sys.exit(1)
     
     # Check if PyInstaller is installed
     try:

@@ -57,20 +57,44 @@ def fetch_schedule_html_browser(timeout: int = 20, user_agent: Optional[str] = N
     if not PLAYWRIGHT_AVAILABLE:
         raise ImportError("Playwright not available. Install with: pip install playwright && python -m playwright install")
     
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        try:
-            context = browser.new_context(user_agent=user_agent or "KackyWatcher/1.0 (+https://kacky.gg/schedule)")
-            page = context.new_page()
-            page.set_default_timeout(timeout * 1000)
-            page.goto(SCHEDULE_URL, wait_until="domcontentloaded")
-            # Wait briefly for dynamic content; look for either LIVE badge or Server label
+    logging.debug("Starting Playwright browser fetch...")
+    logging.debug("PLAYWRIGHT_AVAILABLE: %s", PLAYWRIGHT_AVAILABLE)
+    logging.debug("Timeout: %d seconds", timeout)
+    
+    try:
+        logging.debug("Creating Playwright context...")
+        with sync_playwright() as p:
+            logging.debug("Launching Chromium browser...")
+            browser = p.chromium.launch(headless=True)
+            logging.debug("Browser launched successfully")
             try:
-                page.wait_for_selector(r"text=/LIVE|Server \d+/", timeout=timeout * 1000)
-            except Exception:
-                pass  # Timeout is acceptable, continue with what we have
-            html = page.content()
-            return html
-        finally:
-            browser.close()
+                logging.debug("Creating browser context...")
+                context = browser.new_context(user_agent=user_agent or "KackyWatcher/1.0 (+https://kacky.gg/schedule)")
+                logging.debug("Creating new page...")
+                page = context.new_page()
+                page.set_default_timeout(timeout * 1000)
+                
+                logging.debug("Navigating to %s...", SCHEDULE_URL)
+                page.goto(SCHEDULE_URL, wait_until="domcontentloaded")
+                logging.debug("Page loaded, waiting for dynamic content...")
+                
+                # Wait briefly for dynamic content; look for either LIVE badge or Server label
+                try:
+                    page.wait_for_selector(r"text=/LIVE|Server \d+/", timeout=timeout * 1000)
+                    logging.debug("Dynamic content selector found")
+                except Exception as e:
+                    logging.warning("Timeout waiting for dynamic content selector: %s", e)
+                    # Timeout is acceptable, continue with what we have
+                
+                logging.debug("Getting page content...")
+                html = page.content()
+                logging.debug("Retrieved page content: %d characters", len(html))
+                return html
+            finally:
+                logging.debug("Closing browser...")
+                browser.close()
+                logging.debug("Browser closed")
+    except Exception as e:
+        logging.error("Error in browser fetch: %s", e, exc_info=True)
+        raise
 

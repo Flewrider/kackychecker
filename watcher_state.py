@@ -35,6 +35,9 @@ class WatcherState:
         self.upcoming_by_map: Dict[int, List[Tuple[str, int]]] = {}
         # Remember which watched maps are currently live to avoid repeat notifications
         self.notified_live: Set[int] = set()
+        # Track maps that recently reached 0:00 (cooldown period to exclude from live tab)
+        # Maps are excluded from live display for 5 minutes after reaching 0:00
+        self.recently_finished_by_map: Dict[int, float] = {}
     
     def update_from_fetch(self, rows: List[Dict[str, str]], watched: Set[int]) -> Set[int]:
         """
@@ -66,6 +69,13 @@ class WatcherState:
             srv = r.get("server", "") or ""
             
             if r.get("is_live"):
+                # Check if map is in cooldown period - if so, ignore it even if website says it's live
+                cooldown_until = self.recently_finished_by_map.get(mn, 0)
+                if cooldown_until > now_ts:
+                    logging.debug("Map #%s is in cooldown period (until %s), ignoring live status from website", mn, cooldown_until - now_ts)
+                    continue  # Skip this map, don't add it to live_now or live_until_by_map
+                
+                logging.debug("Map #%s detected as live, adding to live_now", mn)
                 live_now.add(mn)
                 # Only set live window if newly live (not already tracked)
                 if mn not in self.live_until_by_map:
@@ -116,7 +126,13 @@ class WatcherState:
                 del self.live_until_by_map[mn]
             if mn in self.live_servers_by_map:
                 del self.live_servers_by_map[mn]
-            logging.debug("Map #%s no longer live, removed from live window", mn)
+            # If map just finished (was live but no longer in live_now), mark it for cooldown
+            # Only mark if not already in cooldown (to avoid resetting cooldown timer)
+            if mn not in self.recently_finished_by_map or self.recently_finished_by_map[mn] <= now_ts:
+                self.recently_finished_by_map[mn] = now_ts + 300  # 5 minutes cooldown
+                logging.debug("Map #%s no longer live, removed from live window and starting 5-minute cooldown", mn)
+            else:
+                logging.debug("Map #%s no longer live, removed from live window (already in cooldown)", mn)
         
         return live_now
     
@@ -128,10 +144,25 @@ class WatcherState:
         Args:
             decrement_seconds: How many seconds to subtract from each ETA
         """
+        now_ts = time.time()
         for k in list(self.eta_seconds_by_map.keys()):
+            old_value = self.eta_seconds_by_map[k]
             self.eta_seconds_by_map[k] = max(0, self.eta_seconds_by_map[k] - decrement_seconds)
+            # If ETA just reached 0, mark map as recently finished (5 minute cooldown)
+            if old_value > 0 and self.eta_seconds_by_map[k] == 0:
+                self.recently_finished_by_map[k] = now_ts + 300  # 5 minutes cooldown
+                logging.debug("Map #%s reached 0:00, starting 5-minute cooldown period", k)
+        
         for mn, items in list(self.upcoming_by_map.items()):
-            updated = [(s, max(0, t - decrement_seconds)) for s, t in items]
+            updated = []
+            for s, t in items:
+                old_t = t
+                new_t = max(0, t - decrement_seconds)
+                updated.append((s, new_t))
+                # If ETA just reached 0, mark map as recently finished
+                if old_t > 0 and new_t == 0:
+                    self.recently_finished_by_map[mn] = now_ts + 300  # 5 minutes cooldown
+                    logging.debug("Map #%s reached 0:00 on server %s, starting 5-minute cooldown period", mn, s)
             self.upcoming_by_map[mn] = updated
     
     def cleanup_expired_live_windows(self, now_ts: float) -> None:
@@ -145,6 +176,16 @@ class WatcherState:
             if self.live_until_by_map[mn] <= now_ts:
                 del self.live_until_by_map[mn]
                 self.live_servers_by_map.pop(mn, None)
+                # Mark map for cooldown when its live window expires
+                # Only mark if not already in cooldown (to avoid resetting cooldown timer)
+                if mn not in self.recently_finished_by_map or self.recently_finished_by_map[mn] <= now_ts:
+                    self.recently_finished_by_map[mn] = now_ts + 300  # 5 minutes cooldown
+                    logging.debug("Map #%s live window expired, marking for 5-minute cooldown", mn)
+        
+        # Clean up expired cooldown entries
+        for mn in list(self.recently_finished_by_map.keys()):
+            if self.recently_finished_by_map[mn] <= now_ts:
+                del self.recently_finished_by_map[mn]
     
     def get_live_summary(self, watched: Set[int], live_now: Set[int], now_ts: float) -> List[int]:
         """
@@ -170,12 +211,24 @@ class WatcherState:
                 if mn not in live_now:
                     del self.live_until_by_map[mn]
                     self.live_servers_by_map.pop(mn, None)
-            live_summary = sorted(live_now & watched)
+            # Filter out maps in cooldown period (recently finished)
+            # If a map is in live_now (from recent fetch), it's currently live on the website
+            # We only need to check cooldown, not live window (since live_now is source of truth)
+            live_summary = []
+            for mn in sorted(live_now & watched):
+                cooldown_until = self.recently_finished_by_map.get(mn, 0)
+                if cooldown_until <= now_ts:
+                    live_summary.append(mn)
+                else:
+                    logging.debug("Map #%s in live_now but filtered out due to cooldown (until %s)", mn, cooldown_until - now_ts)
+            live_summary = sorted(live_summary)
         else:
             # No recent fetch: use live windows for persistence
             for mn in sorted(watched):
                 if mn in self.live_until_by_map and self.live_until_by_map[mn] > now_ts:
-                    live_summary.append(mn)
+                    # Exclude maps in cooldown period
+                    if self.recently_finished_by_map.get(mn, 0) <= now_ts:
+                        live_summary.append(mn)
         
         return live_summary
     
