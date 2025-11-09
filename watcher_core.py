@@ -11,6 +11,7 @@ from typing import Dict, List, Set, Tuple, Callable, Optional, Any
 from config import load_config, setup_logging
 from schedule_fetcher import fetch_schedule_html, fetch_schedule_html_browser
 from schedule_parser import parse_live_maps
+from schedule_parser_maps import parse_maps_view, calculate_server_uptimes_from_maps
 from map_status_manager import get_tracking_maps
 from watcher_state import WatcherState
 from path_utils import get_map_status_file
@@ -56,6 +57,9 @@ class KackyWatcher:
         self.live_map_resync_times: Dict[int, float] = {}  # Track when to resync live maps (1 minute after going live)
         self.periodic_refetch_time: float = 0.0  # Track when to do periodic refetch (for unknown time maps and staleness)
         self.initial_fetch_done = False  # Track if initial fetch has been done
+        self.last_maps_view_fetch_time: float = 0.0  # Track when we last fetched Maps view for uptime calculation
+        self.maps_view_fetch_interval: float = 300.0  # Fetch Maps view every 5 minutes to update server uptimes
+        self.maps_view_initial_fetch_done = False  # Track if initial Maps view fetch has been done
         self.watched: Set[int] = get_tracking_maps(self.status_file)
         
         if not self.watched:
@@ -235,7 +239,7 @@ class KackyWatcher:
             logging.debug("[browser] Fetched %d chars of HTML", len(html))
             if len(html) < 100:
                 logging.warning("[browser] HTML content seems very short: %d chars", len(html))
-            rows = parse_live_maps(html)
+            rows = parse_live_maps(html, server_uptimes=self.state.server_uptime_seconds)
             logging.debug("[browser] Parsed %d schedule rows", len(rows))
         except Exception as e:
             logging.error("Browser fetch failed: %s", e, exc_info=True)
@@ -244,7 +248,7 @@ class KackyWatcher:
             try:
                 html = fetch_schedule_html(self.config["USER_AGENT"], self.config["REQUEST_TIMEOUT_SECONDS"])
                 logging.debug("Fetched %d chars of HTML (fallback)", len(html))
-                rows = parse_live_maps(html)
+                rows = parse_live_maps(html, server_uptimes=self.state.server_uptime_seconds)
                 logging.debug("Parsed %d schedule rows (fallback)", len(rows))
             except Exception as e2:
                 logging.error("HTTP fallback also failed: %s", e2, exc_info=True)
@@ -261,6 +265,52 @@ class KackyWatcher:
             logging.debug("Successfully fetched and parsed %d schedule rows", len(rows))
         
         return rows
+    
+    def fetch_and_update_server_uptimes(self) -> bool:
+        """
+        Fetch Maps view and update server uptimes.
+        This provides more accurate uptime calculation by analyzing
+        consecutive map ETAs on each server.
+        
+        Returns:
+            True if uptimes were successfully updated
+        """
+        logging.debug("Fetching Maps view to update server uptimes...")
+        try:
+            html = fetch_schedule_html_browser(
+                timeout=self.config["REQUEST_TIMEOUT_SECONDS"] * 2,
+                user_agent=self.config["USER_AGENT"],
+                view="maps"
+            )
+            logging.debug("[Maps view] Fetched %d chars of HTML", len(html))
+            
+            # Parse Maps view
+            maps_data = parse_maps_view(html)
+            logging.debug("[Maps view] Parsed %d maps", len(maps_data))
+            
+            if not maps_data:
+                logging.warning("[Maps view] No maps parsed from Maps view")
+                return False
+            
+            # Calculate server uptimes from Maps view data
+            server_uptimes = calculate_server_uptimes_from_maps(maps_data)
+            logging.debug("[Maps view] Calculated uptimes for %d servers: %s", 
+                         len(server_uptimes), server_uptimes)
+            
+            if server_uptimes:
+                # Update state with new uptimes
+                updated = self.state.update_server_uptimes_from_maps_view(server_uptimes)
+                if updated:
+                    logging.debug("[Maps view] Successfully updated server uptimes")
+                    self.on_status_update("Server uptimes updated from Maps view")
+                return updated
+            else:
+                logging.warning("[Maps view] No server uptimes calculated")
+                return False
+                
+        except Exception as e:
+            logging.error("[Maps view] Failed to fetch or update server uptimes: %s", e, exc_info=True)
+            return False
     
     def format_summary(self, rows: List[Dict[str, str]], did_fetch: bool, live_now: Optional[Set[int]] = None) -> Tuple[List[int], List[Tuple[int, str]]]:
         """
@@ -398,13 +448,13 @@ class KackyWatcher:
             # Automatically mark expired ETAs as live locally (no fetch needed)
             for mn in expired_etas:
                 if mn not in self.state.live_until_by_map or self.state.live_until_by_map[mn] <= now_ts:
-                    # Mark as live with default duration
-                    self.state.live_until_by_map[mn] = now_ts + self.state.live_duration_seconds
+                    # Mark as live with server's uptime duration
+                    server = self.state.server_by_map.get(mn, "")
+                    server_uptime = self.state.get_server_uptime(server)
+                    self.state.live_until_by_map[mn] = now_ts + server_uptime
                     # Schedule resync fetch 1 minute after going live
                     self.live_map_resync_times[mn] = now_ts + 60.0
-                    logging.debug("Map #%s ETA expired locally, marked as live (resync in 60s)", mn)
-                    # Get server from state if available
-                    server = self.state.server_by_map.get(mn, "")
+                    logging.debug("Map #%s ETA expired locally, marked as live (server uptime %ds, resync in 60s)", mn, server_uptime)
                     if server:
                         self.state.live_servers_by_map.setdefault(mn, set()).add(server)
                     # Remove from ETA tracking since it's now live
@@ -481,6 +531,30 @@ class KackyWatcher:
                         did_fetch = True
                         self.last_fetch_time = now_ts
                         self.initial_fetch_done = True
+            
+            # Check if we should fetch Maps view to update server uptimes
+            # Fetch Maps view on initial run and then periodically (every 5 minutes)
+            should_fetch_maps_view = False
+            if not self.maps_view_initial_fetch_done:
+                # Initial fetch - do it after first successful schedule fetch
+                if self.initial_fetch_done:
+                    should_fetch_maps_view = True
+                    logging.debug("Fetching Maps view to update server uptimes (initial)")
+            elif now_ts - self.last_maps_view_fetch_time >= self.maps_view_fetch_interval:
+                should_fetch_maps_view = True
+                logging.debug("Fetching Maps view to update server uptimes (periodic)")
+            
+            if should_fetch_maps_view:
+                try:
+                    self.fetch_and_update_server_uptimes()
+                    self.last_maps_view_fetch_time = now_ts
+                    self.maps_view_initial_fetch_done = True
+                except Exception as e:
+                    logging.error("Error fetching Maps view: %s", e, exc_info=True)
+                    # Don't update last_maps_view_fetch_time on error, so we retry sooner
+                    # But mark initial fetch as done to avoid infinite retries on startup
+                    if not self.maps_view_initial_fetch_done:
+                        self.maps_view_initial_fetch_done = True
             
             # Update state from fetch if we fetched (only syncs times, doesn't change state)
             if did_fetch:

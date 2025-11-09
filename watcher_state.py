@@ -7,6 +7,9 @@ import time
 import re
 from typing import Dict, List, Set, Tuple, Optional
 
+from map_status_manager import get_server_uptimes
+from path_utils import get_map_status_file
+
 
 class WatcherState:
     """
@@ -35,6 +38,31 @@ class WatcherState:
         self.upcoming_by_map: Dict[int, List[Tuple[str, int]]] = {}
         # Remember which watched maps are currently live to avoid repeat notifications
         self.notified_live: Set[int] = set()
+        
+        # Server uptime tracking (in seconds, always full minutes)
+        # Initialize with known defaults, then load persisted values if available
+        # Servers 1-4: 10 minutes (600 seconds)
+        # Servers 5-8: 13 minutes (780 seconds)
+        # Servers 9-10: 15 minutes (900 seconds)
+        self.server_uptime_seconds: Dict[str, int] = {}
+        for server_num in range(1, 5):
+            self.server_uptime_seconds[f"Server {server_num}"] = 600  # 10 minutes
+        for server_num in range(5, 9):
+            self.server_uptime_seconds[f"Server {server_num}"] = 780  # 13 minutes
+        for server_num in range(9, 11):
+            self.server_uptime_seconds[f"Server {server_num}"] = 900  # 15 minutes
+        
+        # Load persisted server uptimes from file (overrides defaults)
+        try:
+            persisted_uptimes = get_server_uptimes(get_map_status_file())
+            if persisted_uptimes:
+                # Only update if we have valid persisted values
+                for server, uptime in persisted_uptimes.items():
+                    if isinstance(uptime, int) and uptime > 0:
+                        self.server_uptime_seconds[server] = uptime
+                logging.debug("Loaded persisted server uptimes: %s", persisted_uptimes)
+        except Exception as e:
+            logging.debug("Could not load persisted server uptimes: %s", e)
     
     def update_from_fetch(self, rows: List[Dict[str, str]], watched: Set[int]) -> Set[int]:
         """
@@ -69,9 +97,18 @@ class WatcherState:
                 needs_retry = r.get("needs_retry", False)
                 
                 # Skip maps with empty time cells (transitioning) - handle locally
-                if needs_retry and remaining_time_str == "600":
-                    logging.debug("Map #%s has empty time cell (transitioning), skipping time update", mn)
+                # When needs_retry is True, the parser used server_uptime as a placeholder
+                # We shouldn't update state with placeholder data, but we can learn from real data
+                if needs_retry:
+                    # The parser set remaining_time to server_uptime as a placeholder
+                    # Don't update state with this placeholder - handle locally using server uptime
+                    logging.debug("Map #%s has empty time cell (transitioning), skipping time update (will use server uptime locally)", mn)
+                    # Still add to live_now for reference, but don't update live_until_by_map
+                    live_now.add(mn)
                     continue
+                
+                # Server uptime learning is now handled by Maps view fetching
+                # (see watcher_core.fetch_and_update_server_uptimes)
                 
                 # Update live time if map is already live locally
                 if mn in self.live_until_by_map:
@@ -89,8 +126,10 @@ class WatcherState:
                         self.live_until_by_map[mn] = now_ts + remaining_seconds
                         logging.debug("Map #%s added to live state (new map): remaining %ds", mn, remaining_seconds)
                     else:
-                        self.live_until_by_map[mn] = now_ts + self.live_duration_seconds
-                        logging.debug("Map #%s added to live state (new map): default duration", mn)
+                        # Use server's uptime instead of default duration
+                        server_uptime = self.get_server_uptime(srv)
+                        self.live_until_by_map[mn] = now_ts + server_uptime
+                        logging.debug("Map #%s added to live state (new map): server uptime %ds", mn, server_uptime)
                     if srv:
                         self.live_servers_by_map.setdefault(mn, set()).add(srv)
                 # If map is in tracked (has ETA), don't change state - it will transition locally when ETA hits 0
@@ -356,4 +395,69 @@ class WatcherState:
         if not candidates:
             return None
         return min(candidates)
+    
+    def get_server_uptime(self, server: str) -> int:
+        """
+        Get uptime for a server, falling back to default if unknown.
+        
+        Args:
+            server: Server label (e.g., "Server 1")
+            
+        Returns:
+            Uptime in seconds (always a full minute)
+        """
+        if not server:
+            return 600  # Default fallback
+        return self.server_uptime_seconds.get(server, 600)
+    
+    def update_server_uptimes_from_maps_view(self, server_uptimes: Dict[str, int]) -> bool:
+        """
+        Update server uptimes from Maps view data.
+        This is the primary method for learning server uptimes.
+        
+        Args:
+            server_uptimes: Dictionary of server -> uptime in seconds (from Maps view calculation)
+            
+        Returns:
+            True if any uptimes were updated
+        """
+        updated = False
+        for server, uptime_seconds in server_uptimes.items():
+            if not server or uptime_seconds <= 0:
+                continue
+            
+            current_uptime = self.server_uptime_seconds.get(server)
+            # Update if different (Maps view is authoritative)
+            if current_uptime != uptime_seconds:
+                old_uptime = current_uptime
+                self.server_uptime_seconds[server] = uptime_seconds
+                updated = True
+                logging.debug("Updated server %s uptime from Maps view: %ds -> %ds (%d minutes)", 
+                             server, old_uptime if old_uptime else 0, uptime_seconds, uptime_seconds // 60)
+        
+        if updated:
+            self._save_server_uptimes()
+        
+        return updated
+    
+    def _save_server_uptimes(self) -> None:
+        """
+        Save server uptimes to map_status.json file.
+        This is called automatically when server uptimes are updated.
+        """
+        try:
+            from map_status_manager import load_map_status, save_map_status
+            from path_utils import get_map_status_file
+            
+            status_path = get_map_status_file()
+            # Load existing data to preserve tracking/finished maps
+            existing_data = load_map_status(status_path)
+            tracking = existing_data.get("tracking", set())
+            finished = existing_data.get("finished", set())
+            
+            # Save with updated server uptimes
+            save_map_status(tracking, finished, status_path, self.server_uptime_seconds)
+            logging.debug("Saved server uptimes to %s", status_path)
+        except Exception as e:
+            logging.debug("Could not save server uptimes: %s", e)
 

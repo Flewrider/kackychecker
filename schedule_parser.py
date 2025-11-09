@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 from bs4 import BeautifulSoup
 
 
-def parse_live_maps(html: str) -> List[Dict[str, str]]:
+def parse_live_maps(html: str, server_uptimes: Optional[Dict[str, int]] = None) -> List[Dict[str, str]]:
     """
     Parse schedule HTML to extract map information.
     
@@ -21,6 +21,8 @@ def parse_live_maps(html: str) -> List[Dict[str, str]]:
     
     Args:
         html: HTML content from schedule page
+        server_uptimes: Optional dict of server uptimes (server -> seconds)
+                       Used to calculate ETAs when time is missing
         
     Returns:
         List of dictionaries with keys:
@@ -126,11 +128,15 @@ def parse_live_maps(html: str) -> List[Dict[str, str]]:
                             server_num, time_text, remaining_seconds, cell_text[:50])
             else:
                 # Time cell is empty - this happens during map transitions
-                # Use default duration (10 minutes = 600 seconds) and mark for retry
-                logging.debug("Server %s (map %s): time cell is empty (transitioning?), using default duration. Cell text: '%s'", 
-                            server_num, live_map_num, cell_text[:100])
-                remaining_seconds = 600  # Default 10 minutes
+                # Use server's known uptime instead of hardcoded default
+                if server_uptimes:
+                    server_uptime = server_uptimes.get(server_label, 600)
+                else:
+                    server_uptime = 600  # Fallback default
+                remaining_seconds = server_uptime
                 needs_retry = True
+                logging.debug("Server %s (map %s): time cell is empty (transitioning?), using server uptime %ds. Cell text: '%s'", 
+                            server_num, live_map_num, server_uptime, cell_text[:100])
             
             # Column 3: Next maps (upcoming maps) - parse these even if time is missing
             next_maps_cell = cells[2]
@@ -147,8 +153,14 @@ def parse_live_maps(html: str) -> List[Dict[str, str]]:
             })
             
             # Calculate ETAs for next maps
-            # If we have a valid time, use it; otherwise use default duration
-            base_eta_seconds = remaining_seconds if remaining_seconds is not None else 600
+            # Get server uptime for calculating subsequent map ETAs
+            if server_uptimes:
+                server_uptime = server_uptimes.get(server_label, 600)
+            else:
+                server_uptime = 600  # Fallback default
+            
+            # If we have a valid time, use it; otherwise use server uptime
+            base_eta_seconds = remaining_seconds if remaining_seconds is not None else server_uptime
             
             for idx, next_map_link in enumerate(next_map_links):
                 next_map_text = next_map_link.get_text(strip=True)
@@ -160,9 +172,9 @@ def parse_live_maps(html: str) -> List[Dict[str, str]]:
                 
                 next_map_num = next_map_match.group(1)
                 
-                # Calculate ETA: first map = remaining_time, each subsequent = +10 minutes
-                # If time was missing, ETAs are estimates
-                eta_seconds = base_eta_seconds + (idx * 600)  # 600 seconds = 10 minutes
+                # Calculate ETA: first map = remaining_time, each subsequent = +server_uptime
+                # Use server-specific uptime instead of hardcoded 600 seconds
+                eta_seconds = base_eta_seconds + (idx * server_uptime)
                 
                 # Convert to M:SS format
                 eta_minutes = eta_seconds // 60
