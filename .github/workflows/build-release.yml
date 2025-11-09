@@ -62,7 +62,7 @@ jobs:
         echo "Created version: $version"
     
     - name: Create Release (main branch only)
-      if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+      if: github.ref == 'refs/heads/main'
       uses: softprops/action-gh-release@v1
       with:
         files: dist/KackyWatcher.zip
