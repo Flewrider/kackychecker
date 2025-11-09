@@ -75,16 +75,25 @@ def fetch_schedule_html_browser(timeout: int = 20, user_agent: Optional[str] = N
                 page.set_default_timeout(timeout * 1000)
                 
                 logging.debug("Navigating to %s...", SCHEDULE_URL)
-                page.goto(SCHEDULE_URL, wait_until="domcontentloaded")
-                logging.debug("Page loaded, waiting for dynamic content...")
+                # Use domcontentloaded for fast initial load
+                page.goto(SCHEDULE_URL, wait_until="domcontentloaded", timeout=timeout * 1000)
+                logging.debug("DOM loaded")
                 
-                # Wait briefly for dynamic content; look for either LIVE badge or Server label
+                # Wait for the table element that we actually parse (short timeout)
+                # This ensures the dynamic content is rendered without waiting too long
+                table_found = False
                 try:
-                    page.wait_for_selector(r"text=/LIVE|Server \d+/", timeout=timeout * 1000)
-                    logging.debug("Dynamic content selector found")
-                except Exception as e:
-                    logging.warning("Timeout waiting for dynamic content selector: %s", e)
-                    # Timeout is acceptable, continue with what we have
+                    page.wait_for_selector("table[data-slot='table'], table", timeout=2000)
+                    logging.debug("Schedule table found")
+                    table_found = True
+                except Exception:
+                    # Table not found immediately - wait a bit for JS to render
+                    logging.debug("Table not found immediately, waiting for JS to render...")
+                    page.wait_for_timeout(1500)  # Wait 1.5 seconds for JS to render
+                
+                # If table was found quickly, give JS a moment to finish rendering data
+                if table_found:
+                    page.wait_for_timeout(500)  # Brief wait to ensure data is populated
                 
                 logging.debug("Getting page content...")
                 html = page.content()

@@ -811,7 +811,7 @@ class KackyWatcherGUI:
             if not HAS_NOTIFICATIONS:
                 logging.debug("win10toast not available (HAS_NOTIFICATIONS=False)")
         
-        # Transition refetches removed - the 5-minute cooldown period handles map transitions
+        # Transition refetches removed - maps can appear live on different servers immediately
     
     def on_summary_update(self, live_maps: List[int], tracked_lines: List[Tuple[int, str]]) -> None:
         """
@@ -1041,14 +1041,14 @@ class KackyWatcherGUI:
         self.running = True
         
         def watcher_loop():
-            """Watcher thread main loop."""
+            """Watcher thread main loop. Simplified: poll every second for countdown."""
             self.watcher = KackyWatcher(
                 config=self.config,
                 on_status_update=lambda msg: self._queue_status_update(msg),
                 on_live_notification=self.on_live_notification,
                 on_summary_update=self.on_summary_update,
             )
-            # Override run to use poll_once in a loop we can control
+            # Simplified: poll every second to handle countdown and fetch triggers
             while self.running:
                 try:
                     # Check if immediate fetch is requested
@@ -1062,18 +1062,12 @@ class KackyWatcherGUI:
                     self.last_fetch_timestamp = time.time()
                     self.last_countdown_update = time.time()  # Reset countdown timer on fetch
                     
-                    # Calculate next fetch time dynamically
-                    next_fetch_sec = self.watcher.calculate_next_fetch_time(time.time())
-                    if next_fetch_sec > 0:
-                        # Sleep in smaller intervals to allow interruption
-                        sleep_interval = 0.5  # Check every 0.5 seconds
-                        slept = 0.0
-                        while slept < next_fetch_sec and self.running and not self.immediate_fetch_event.is_set():
-                            time.sleep(sleep_interval)
-                            slept += sleep_interval
-                    else:
-                        # If no fetch time calculated, use minimal sleep
-                        time.sleep(0.5)
+                    # Sleep 1 second - poll_once handles countdown internally
+                    sleep_interval = 1.0
+                    slept = 0.0
+                    while slept < sleep_interval and self.running and not self.immediate_fetch_event.is_set():
+                        time.sleep(0.1)  # Sleep in small intervals to allow interruption
+                        slept += 0.1
                 except Exception as e:
                     self._queue_status_update(f"Watcher error: {e}")
                     time.sleep(1)

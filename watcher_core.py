@@ -53,8 +53,9 @@ class KackyWatcher:
         self.last_fetch_time = 0.0  # Track when we last fetched to prevent rapid refetches
         self.last_successful_fetch_time = 0.0  # Track when we last successfully fetched data
         self.consecutive_fetch_failures = 0  # Track consecutive fetch failures
-        self.maps_needing_retry: Set[int] = set()  # Maps that are live but need a retry fetch (transitioning)
-        self.retry_scheduled_time: float = 0.0  # When to retry fetching for transitioning maps
+        self.live_map_resync_times: Dict[int, float] = {}  # Track when to resync live maps (1 minute after going live)
+        self.periodic_refetch_time: float = 0.0  # Track when to do periodic refetch (for unknown time maps and staleness)
+        self.initial_fetch_done = False  # Track if initial fetch has been done
         self.watched: Set[int] = get_tracking_maps(self.status_file)
         
         if not self.watched:
@@ -95,6 +96,8 @@ class KackyWatcher:
     def should_fetch(self, now_ts: float) -> Tuple[bool, Optional[str], List[Tuple[int, int, str]]]:
         """
         Determine if we should fetch the schedule.
+        Fetches are ONLY for syncing times, not for state transitions.
+        State transitions (tracked -> live, live -> tracked) are handled locally.
         
         Args:
             now_ts: Current timestamp
@@ -102,47 +105,81 @@ class KackyWatcher:
         Returns:
             Tuple of (should_fetch: bool, fetch_reason: str | None, triggering_maps: List)
         """
-        # Check if any live maps are expiring very soon (within 10 seconds)
-        # Use a tight threshold to avoid excessive fetching
-        # Only check tracked maps
-        expiring_live = self.state.has_expiring_live_windows(
-            now_ts,
-            threshold_sec=10,  # Only fetch when very close to expiry
-            margin_sec=0,
-            watched=self.watched  # Only check tracked maps
-        )
-        
-        # Determine nearest ETA
-        threshold_sec = self.config["ETA_FETCH_THRESHOLD_SECONDS"]
-        nearest_eta, triggering_maps = self.state.get_nearest_eta(self.watched, threshold_sec, now_ts)
-        # Convert to list of tuples for consistency
-        
         fetch_reason = None
-        if not self.state.eta_seconds_by_map:
+        triggering_maps = []
+        
+        # 1. Initial fetch (only once) - to get initial state
+        if not self.initial_fetch_done:
             fetch_reason = "initial"
-        elif self.watchlist_added:
-            fetch_reason = "watchlist_added"
-        elif expiring_live:
-            fetch_reason = "live_window_expiring"
-        elif nearest_eta <= threshold_sec:
-            fetch_reason = "eta_threshold"
+            should_fetch = True
+            logging.debug("Fetch decision: initial fetch (first run)")
+            return should_fetch, fetch_reason, triggering_maps
         
-        should_fetch = fetch_reason is not None
+        # 2. Map added with no data - fetch to get ETA/live status
+        if self.watchlist_added:
+            # Check if we have data for the new maps
+            new_maps = self.watched - set(self.state.eta_seconds_by_map.keys()) - set(self.state.live_until_by_map.keys())
+            if new_maps:
+                fetch_reason = "watchlist_added"
+                should_fetch = True
+                logging.debug("Fetch decision: new maps added with no data: %s", sorted(new_maps))
+                return should_fetch, fetch_reason, triggering_maps
         
-        logging.debug(
-            "Fetch decision: nearest_eta=%ss, threshold=%ss, watchlist_added=%s, should_fetch=%s (%s)",
-            nearest_eta,
-            threshold_sec,
-            self.watchlist_added,
-            should_fetch,
-            fetch_reason,
-        )
+        # 3. Resync time for live maps (1 minute after going live) - to sync remaining time
+        maps_needing_resync = []
+        for mn, resync_time in list(self.live_map_resync_times.items()):
+            if now_ts >= resync_time:
+                maps_needing_resync.append(mn)
         
+        if maps_needing_resync:
+            fetch_reason = "live_resync"
+            should_fetch = True
+            logging.debug("Fetch decision: resync time for live maps: %s", sorted(maps_needing_resync))
+            return should_fetch, fetch_reason, triggering_maps
+        
+        # 4. Periodic refetch for unknown time maps and staleness prevention
+        # Check if we have tracked maps with no ETA (unknown time)
+        has_unknown_time_maps = False
+        if self.watched:
+            for mn in self.watched:
+                # Map is tracked but has no ETA and is not live
+                if (mn not in self.state.eta_seconds_by_map and 
+                    mn not in self.state.live_until_by_map):
+                    has_unknown_time_maps = True
+                    break
+        
+        # Schedule periodic refetch if not already scheduled
+        # Every 60 seconds if unknown time maps, or every 5 minutes for staleness prevention
+        if self.periodic_refetch_time == 0.0:
+            if has_unknown_time_maps:
+                # More frequent refetch for unknown time maps
+                self.periodic_refetch_time = now_ts + 60.0
+                logging.debug("Scheduled periodic refetch in 60s (unknown time maps detected)")
+            elif self.last_successful_fetch_time > 0:
+                # Periodic refetch every 5 minutes to prevent staleness
+                self.periodic_refetch_time = now_ts + 300.0
+                logging.debug("Scheduled periodic refetch in 300s (staleness prevention)")
+            # If last_successful_fetch_time is 0, we haven't fetched yet - wait for initial fetch
+        
+        # Check if it's time for periodic refetch
+        if self.periodic_refetch_time > 0 and now_ts >= self.periodic_refetch_time:
+            fetch_reason = "periodic_refetch"
+            should_fetch = True
+            if has_unknown_time_maps:
+                logging.debug("Fetch decision: periodic refetch for unknown time maps")
+            else:
+                logging.debug("Fetch decision: periodic refetch for staleness prevention")
+            return should_fetch, fetch_reason, triggering_maps
+        
+        # No fetch needed - all state transitions are handled locally
+        should_fetch = False
+        logging.debug("Fetch decision: no fetch needed (all state handled locally)")
         return should_fetch, fetch_reason, triggering_maps
     
     def calculate_next_fetch_time(self, now_ts: float) -> float:
         """
         Calculate how many seconds until the next fetch is needed.
+        Fetches are only for syncing times (initial, new maps, resync).
         
         Args:
             now_ts: Current timestamp
@@ -154,51 +191,27 @@ class KackyWatcher:
         if self.watchlist_added:
             return 0.0
         
-        # Calculate time until next live window expires (only for tracked maps)
-        next_live_expiry = self.state.get_next_live_window_expiry(now_ts, watched=self.watched)
-        time_until_live_expiry = None
-        if next_live_expiry:
-            time_until_live_expiry = max(0.0, next_live_expiry - now_ts)
-            # Only fetch when very close to expiry (within 10 seconds) to avoid continuous fetching
-            # This allows the live window to persist naturally without constant refetches
-            if time_until_live_expiry <= 10.0:
-                return 0.0  # Fetch immediately if expiring very soon (within 10s)
-            # Otherwise, return time until we need to fetch (when within 10s of expiry)
-            # This prevents fetching too early - wait until 10s before expiry
-            return max(1.0, time_until_live_expiry - 10.0)
-        
-        # Calculate time until next ETA expires
-        next_eta_sec = self.state.get_next_eta_expiry(self.watched, now_ts)
-        time_until_eta_expiry = None
-        if next_eta_sec is not None:
-            time_until_eta_expiry = float(next_eta_sec)
-            # If ETA is within threshold, fetch immediately
-            if time_until_eta_expiry <= self.config["ETA_FETCH_THRESHOLD_SECONDS"]:
+        # Check for earliest resync time
+        if self.live_map_resync_times:
+            earliest_resync = min(self.live_map_resync_times.values())
+            if earliest_resync <= now_ts:
                 return 0.0
+            time_until_resync = earliest_resync - now_ts
+            # Don't return more than periodic refetch time
+            if self.periodic_refetch_time > 0:
+                time_until_periodic = self.periodic_refetch_time - now_ts
+                return min(time_until_resync, max(0.0, time_until_periodic), 300.0)
+            return min(time_until_resync, 300.0)
         
-        # If no state and no watched maps, fetch immediately (initial state)
-        # But if there are watched maps but no ETAs yet, wait a reasonable time before refetching
-        if not self.state.eta_seconds_by_map and not self.state.live_until_by_map:
-            if not self.watched:
-                # No watched maps at all - no need to fetch
-                return 300.0
-            # Have watched maps but no ETAs - wait a bit before refetching (e.g., 30 seconds)
-            # This prevents continuous fetching when a new map is added but not in schedule yet
-            return 30.0
+        # Check for periodic refetch time
+        if self.periodic_refetch_time > 0:
+            if self.periodic_refetch_time <= now_ts:
+                return 0.0
+            time_until_periodic = self.periodic_refetch_time - now_ts
+            return min(time_until_periodic, 300.0)
         
-        # Find minimum time until next event
-        candidates = []
-        if time_until_live_expiry is not None:
-            candidates.append(time_until_live_expiry)
-        if time_until_eta_expiry is not None:
-            candidates.append(time_until_eta_expiry)
-        
-        if not candidates:
-            # No events scheduled, use a reasonable default (5 minutes)
-            return 300.0
-        
-        # Return minimum time, capped at 5 minutes
-        return min(min(candidates), 300.0)
+        # No fetch needed soon, use a reasonable default (5 minutes)
+        return 300.0
     
     def fetch_schedule(self) -> List[Dict[str, str]]:
         """
@@ -269,7 +282,7 @@ class KackyWatcher:
         Args:
             rows: Parsed schedule rows
             did_fetch: Whether we fetched this cycle
-            live_now: Set of live maps from update_from_fetch (already cooldown-filtered)
+            live_now: Set of live maps from update_from_fetch
             
         Returns:
             Tuple of (live_summary: List[int], tracked_lines: List[tuple[int, str]])
@@ -299,7 +312,7 @@ class KackyWatcher:
                 earliest_eta_by_map[mn] = {"eta": eta, "server": r.get("server", "")}
         
         # Determine live maps for summary
-        # Use live_now passed from update_from_fetch (already cooldown-filtered)
+        # Use live_now passed from update_from_fetch
         # If not provided, build from rows (fallback for non-fetch cycles)
         now_ts = time.time()
         if live_now is None:
@@ -360,6 +373,8 @@ class KackyWatcher:
     def poll_once(self, force_fetch: bool = False) -> None:
         """
         Execute one polling cycle.
+        All state transitions (tracked -> live, live -> tracked) are handled locally.
+        Fetches are ONLY for syncing times (initial state, new maps, resync after 1min).
         
         Args:
             force_fetch: If True, force a fetch regardless of should_fetch logic
@@ -370,221 +385,189 @@ class KackyWatcher:
             # Reload map status if needed
             self.reload_status()
             
-            # Decide if we should fetch
             now_ts = time.time()
-            
-            # Check if it's time to retry fetching for transitioning maps (priority check)
-            if not force_fetch and self.maps_needing_retry and now_ts >= self.retry_scheduled_time:
-                should_fetch = True
-                fetch_reason = "retry_transitioning"
-                triggering_maps = []
-                logging.debug("Retry fetch triggered for transitioning maps: %s", sorted(self.maps_needing_retry))
-            elif force_fetch:
-                should_fetch = True
-                fetch_reason = "forced"
-                triggering_maps = []
-            else:
-                should_fetch, fetch_reason, triggering_maps = self.should_fetch(now_ts)
-            
             rows: List[Dict[str, str]] = []
             did_fetch = False
             
+            # Countdown ETAs and live times locally (do this first)
+            self.state.countdown_etas(1)  # Countdown by 1 second
+            
+            # Handle tracked maps whose ETA has reached 0 - automatically mark as live locally
+            expired_etas = []
+            for mn in self.watched:
+                # Check if map's ETA has hit 0 and it's not already live
+                if mn in self.state.eta_seconds_by_map and self.state.eta_seconds_by_map[mn] <= 0:
+                    if mn not in self.state.live_until_by_map or self.state.live_until_by_map[mn] <= now_ts:
+                        expired_etas.append(mn)
+                # Check upcoming servers
+                if mn in self.state.upcoming_by_map:
+                    for srv, sec in self.state.upcoming_by_map[mn]:
+                        if sec <= 0:
+                            if mn not in self.state.live_until_by_map or self.state.live_until_by_map[mn] <= now_ts:
+                                if mn not in expired_etas:
+                                    expired_etas.append(mn)
+                                break
+            
+            # Automatically mark expired ETAs as live locally (no fetch needed)
+            for mn in expired_etas:
+                if mn not in self.state.live_until_by_map or self.state.live_until_by_map[mn] <= now_ts:
+                    # Mark as live with default duration
+                    self.state.live_until_by_map[mn] = now_ts + self.state.live_duration_seconds
+                    # Schedule resync fetch 1 minute after going live
+                    self.live_map_resync_times[mn] = now_ts + 60.0
+                    logging.debug("Map #%s ETA expired locally, marked as live (resync in 60s)", mn)
+                    # Get server from state if available
+                    server = self.state.server_by_map.get(mn, "")
+                    if server:
+                        self.state.live_servers_by_map.setdefault(mn, set()).add(server)
+                    # Remove from ETA tracking since it's now live
+                    # Keep upcoming_by_map for other servers, but remove the primary ETA
+                    self.state.eta_seconds_by_map.pop(mn, None)
+                    # Remove server from upcoming if it matches
+                    if mn in self.state.upcoming_by_map and server:
+                        self.state.upcoming_by_map[mn] = [(s, t) for s, t in self.state.upcoming_by_map[mn] if s != server]
+                        if not self.state.upcoming_by_map[mn]:
+                            del self.state.upcoming_by_map[mn]
+                    # Notify if this is newly live
+                    if mn not in self.state.notified_live:
+                        self.on_live_notification(mn, server)
+                        self.state.mark_notified({mn})
+                        logging.debug("KACKY MAP LIVE: #%s on %s", mn, server if server else "<unknown server>")
+            
+            # Check if we should fetch (simplified logic)
+            if force_fetch:
+                should_fetch = True
+                fetch_reason = "forced"
+            else:
+                should_fetch, fetch_reason, _ = self.should_fetch(now_ts)
+            
+            # Fetch if needed
             if should_fetch:
-                # Prevent rapid refetches - enforce minimum time between fetches (except for immediate triggers)
-                min_fetch_interval = 2.0  # Minimum 2 seconds between fetches
+                # Prevent rapid refetches (minimum 2 seconds between fetches)
+                min_fetch_interval = 2.0
                 if now_ts - self.last_fetch_time < min_fetch_interval:
-                    # Skip fetch if too soon (unless it's a critical reason, forced, or retry)
-                    if fetch_reason not in ("watchlist_added", "initial", "forced", "retry_transitioning"):
+                    if fetch_reason not in ("initial", "watchlist_added", "forced"):
                         should_fetch = False
                         logging.debug("Skipping fetch (too soon after last fetch: %.1fs)", now_ts - self.last_fetch_time)
                 
                 if should_fetch:
-                    # Log fetch reason
-                    if fetch_reason == "retry_transitioning":
-                        logging.debug("Fetching schedule (reason: retry for transitioning maps)")
-                        self.on_status_update(f"Retrying fetch for transitioning maps...")
-                    elif fetch_reason == "initial":
+                    # Log fetch reason and update status
+                    if fetch_reason == "initial":
                         logging.debug("Fetching schedule (reason: initial state)")
                         self.on_status_update("Fetching schedule (initial state)...")
                     elif fetch_reason == "watchlist_added":
-                        logging.debug("Fetching schedule (reason: new map added to watchlist)")
+                        logging.debug("Fetching schedule (reason: new map added with no data)")
                         self.on_status_update("Fetching schedule (new map added)...")
-                    elif fetch_reason == "live_window_expiring":
-                        logging.debug("Fetching schedule (reason: live map window expiring soon)")
-                        self.on_status_update("Fetching schedule (live window expiring)...")
-                    elif fetch_reason == "eta_threshold":
-                        threshold_sec = self.config["ETA_FETCH_THRESHOLD_SECONDS"]
-                        if triggering_maps:
-                            maps_str = ", ".join([
-                                f"#{mn} ({sec//60}:{sec%60:02d} on {srv})" if srv else f"#{mn} ({sec//60}:{sec%60:02d})"
-                                for mn, sec, srv in sorted(triggering_maps, key=lambda x: x[1])
-                            ])
-                            logging.debug("Fetching schedule (reason: nearest tracked ETA ≤ %ss) - triggered by: %s", threshold_sec, maps_str)
-                            self.on_status_update(f"Fetching schedule (ETA threshold: {maps_str})...")
-                        else:
-                            logging.debug("Fetching schedule (reason: nearest tracked ETA ≤ %ss)", threshold_sec)
-                            self.on_status_update(f"Fetching schedule (ETA threshold ≤ {threshold_sec}s)...")
+                    elif fetch_reason == "live_resync":
+                        logging.debug("Fetching schedule (reason: resync time for live maps)")
+                        self.on_status_update("Resyncing live map times...")
+                    elif fetch_reason == "periodic_refetch":
+                        logging.debug("Fetching schedule (reason: periodic refetch)")
+                        self.on_status_update("Periodic refetch...")
                     
-                    # Call fetch_schedule with error handling for all fetch reasons
-                    logging.debug("About to call fetch_schedule()...")
+                    # Fetch schedule
                     try:
                         rows = self.fetch_schedule()
                         logging.debug("fetch_schedule() returned with %d rows", len(rows))
                         did_fetch = True
                         self.last_fetch_time = now_ts
-                    except Exception as e:
-                        logging.error("Exception in fetch_schedule(): %s", e, exc_info=True)
-                        rows = []
-                        did_fetch = True
-                        self.last_fetch_time = now_ts
+                        self.initial_fetch_done = True
                         
-                        # Track successful fetches (rows > 0 means we got data)
+                        # Track successful fetches
                         if rows:
                             self.last_successful_fetch_time = now_ts
                             self.consecutive_fetch_failures = 0
                         else:
                             self.consecutive_fetch_failures += 1
                             if self.consecutive_fetch_failures >= 2:
-                                # After 2 consecutive failures, show warning
                                 time_since_success = now_ts - self.last_successful_fetch_time if self.last_successful_fetch_time > 0 else float('inf')
-                                if time_since_success > 60:  # More than 1 minute since last success
+                                if time_since_success > 60:
                                     self.on_status_update(f"⚠️ Website unreachable or returned no data (last success: {int(time_since_success)}s ago)")
                                 else:
                                     self.on_status_update("⚠️ Website unreachable or returned no data")
-            else:
-                # No fetch this cycle: don't countdown here
-                # The GUI timer handles countdown for smooth display in GUI mode
-                # For CLI mode, countdown happens in the sleep loop
-                # Check if any watched map's ETA has hit 0 or gone negative (should be live now)
-                expired_etas = []
-                for mn in self.watched:
-                    # Check single ETA
-                    if mn in self.state.eta_seconds_by_map and self.state.eta_seconds_by_map[mn] <= 0:
-                        # Only trigger if not already in live window
-                        if mn not in self.state.live_until_by_map or self.state.live_until_by_map[mn] <= now_ts:
-                            # Mark as recently finished if ETA is 0 (5 minute cooldown)
-                            if self.state.eta_seconds_by_map[mn] == 0:
-                                self.state.recently_finished_by_map[mn] = now_ts + 300
-                                logging.debug("Map #%s ETA expired at 0:00, starting 5-minute cooldown", mn)
-                            expired_etas.append(mn)
-                    # Check upcoming servers
-                    if mn in self.state.upcoming_by_map:
-                        for srv, sec in self.state.upcoming_by_map[mn]:
-                            if sec <= 0:
-                                # Only trigger if not already in live window
-                                if mn not in self.state.live_until_by_map or self.state.live_until_by_map[mn] <= now_ts:
-                                    # Mark as recently finished if ETA is 0
-                                    if sec == 0:
-                                        self.state.recently_finished_by_map[mn] = now_ts + 300
-                                        logging.debug("Map #%s ETA expired at 0:00 on server %s, starting 5-minute cooldown", mn, srv)
-                                    if mn not in expired_etas:
-                                        expired_etas.append(mn)
-                                    break
-                
-                if expired_etas:
-                    # ETA has expired, fetch immediately to catch map going live
-                    # Check if enough time has passed since last fetch
-                    if now_ts - self.last_fetch_time >= 2.0:
-                        logging.debug("Fetching schedule (reason: ETA expired for map(s): %s)", sorted(expired_etas))
-                        self.on_status_update(f"Fetching schedule (ETA expired: {', '.join(map(str, sorted(expired_etas)))})...")
-                        logging.debug("About to call fetch_schedule() for expired ETA...")
-                        try:
-                            rows = self.fetch_schedule()
-                            logging.debug("fetch_schedule() returned with %d rows", len(rows))
-                            did_fetch = True
-                            self.last_fetch_time = now_ts
-                            
-                            # Track successful fetches
-                            if rows:
-                                self.last_successful_fetch_time = now_ts
-                                self.consecutive_fetch_failures = 0
-                            else:
-                                self.consecutive_fetch_failures += 1
-                                if self.consecutive_fetch_failures >= 2:
-                                    time_since_success = now_ts - self.last_successful_fetch_time if self.last_successful_fetch_time > 0 else float('inf')
-                                    if time_since_success > 60:
-                                        self.on_status_update(f"⚠️ Website unreachable or returned no data (last success: {int(time_since_success)}s ago)")
-                                    else:
-                                        self.on_status_update("⚠️ Website unreachable or returned no data")
-                        except Exception as e:
-                            logging.error("Exception in fetch_schedule() for expired ETA: %s", e, exc_info=True)
-                            rows = []
-                            did_fetch = True
-                            self.last_fetch_time = now_ts
-                    else:
-                        logging.debug("Skipping fetch for expired ETA (too soon after last fetch)")
-                else:
-                    # Check if we have stale data (all ETAs are 0 and no recent successful fetch)
-                    if self.last_successful_fetch_time > 0:
-                        time_since_success = now_ts - self.last_successful_fetch_time
-                        # Check if all watched maps have ETA 0 (stale data)
-                        all_etas_zero = True
-                        for mn in self.watched:
-                            if mn in self.state.eta_seconds_by_map and self.state.eta_seconds_by_map[mn] > 0:
-                                all_etas_zero = False
-                                break
-                            if mn in self.state.upcoming_by_map:
-                                for s, sec in self.state.upcoming_by_map[mn]:
-                                    if sec > 0:
-                                        all_etas_zero = False
-                                        break
-                        
-                        if all_etas_zero and time_since_success > 120:
-                            # All ETAs are 0 and data is stale
-                            self.on_status_update(f"⚠️ Data may be stale - all ETAs at 0:00 (last fetch: {int(time_since_success)}s ago)")
-                        else:
-                            self.on_status_update("Idle (counting down ETAs)...")
-                    else:
-                        self.on_status_update("Idle (counting down ETAs)...")
+                    except Exception as e:
+                        logging.error("Exception in fetch_schedule(): %s", e, exc_info=True)
+                        rows = []
+                        did_fetch = True
+                        self.last_fetch_time = now_ts
+                        self.initial_fetch_done = True
             
-            # Update state and get live maps
+            # Update state from fetch if we fetched (only syncs times, doesn't change state)
             if did_fetch:
-                # Clear retry flags if this was a retry fetch
-                if fetch_reason == "retry_transitioning":
-                    self.maps_needing_retry.clear()
-                    self.retry_scheduled_time = 0.0
-                    logging.debug("Retry fetch completed, cleared retry flags")
+                # Update times from fetched data (doesn't change live/tracked state)
+                self.state.update_from_fetch(rows, self.watched)
                 
-                # Check for maps that need retry (transitioning maps with empty time cells)
-                maps_to_retry = set()
-                for r in rows:
-                    if r.get("is_live") and r.get("needs_retry", False):
-                        try:
-                            mn = int(r.get("map_number", "0"))
-                            if mn > 0:
-                                maps_to_retry.add(mn)
-                        except ValueError:
-                            pass
+                # Clear resync times for maps that were resynced (they were just fetched)
+                if fetch_reason == "live_resync":
+                    for mn in list(self.live_map_resync_times.keys()):
+                        if now_ts >= self.live_map_resync_times[mn]:
+                            del self.live_map_resync_times[mn]
+                            logging.debug("Cleared resync time for map #%s after resync fetch", mn)
                 
-                if maps_to_retry and self.retry_scheduled_time == 0.0:
-                    # Schedule retry in 8 seconds for transition to complete
-                    retry_delay = 8.0
-                    self.retry_scheduled_time = now_ts + retry_delay
-                    self.maps_needing_retry = maps_to_retry
-                    logging.debug("Scheduled retry in %.1fs for transitioning maps: %s", retry_delay, sorted(maps_to_retry))
+                # Update periodic refetch timer after successful fetch
+                # Check if we have unknown time maps (maps with no ETA and not live)
+                has_unknown_time_maps = False
+                if self.watched:
+                    for mn in self.watched:
+                        if (mn not in self.state.eta_seconds_by_map and 
+                            mn not in self.state.live_until_by_map):
+                            has_unknown_time_maps = True
+                            break
                 
-                live_now = self.state.update_from_fetch(rows, self.watched)
-                
-                # Notify for newly live maps
-                newly_live = self.state.get_newly_live(self.watched, live_now)
-                for mn in sorted(newly_live):
-                    server = next((r.get("server") for r in rows if r.get("map_number") == str(mn) and r.get("server")), "")
-                    self.on_live_notification(mn, server)
-                    logging.debug("KACKY MAP LIVE: #%s on %s", mn, server if server else "<unknown server>")
-                self.state.mark_notified(newly_live)
-                
-                # Clear notifications for maps no longer live
-                no_longer_live = self.state.notified_live - live_now
-                if no_longer_live:
-                    for mn in sorted(no_longer_live):
-                        logging.debug("Map #%s no longer live", mn)
-                    self.state.clear_notifications_for(no_longer_live)
-            else:
-                live_now = set()
+                if fetch_reason == "periodic_refetch":
+                    # Reset timer - will be recalculated on next should_fetch call
+                    self.periodic_refetch_time = 0.0
+                    logging.debug("Reset periodic refetch timer after fetch")
+                elif self.periodic_refetch_time == 0.0 or fetch_reason == "initial":
+                    # Initialize or reset periodic refetch timer
+                    if has_unknown_time_maps:
+                        # More frequent refetch for unknown time maps (60 seconds)
+                        self.periodic_refetch_time = now_ts + 60.0
+                        logging.debug("Scheduled periodic refetch in 60s (unknown time maps)")
+                    else:
+                        # Normal periodic refetch (5 minutes) for staleness prevention
+                        self.periodic_refetch_time = now_ts + 300.0
+                        logging.debug("Scheduled periodic refetch in 300s (staleness prevention)")
+                # If periodic_refetch_time is already set and this wasn't a periodic fetch,
+                # it will be recalculated on the next should_fetch call
             
-            # Format and send summary (pass live_now so it uses the cooldown-filtered version)
-            live_summary, tracked_lines = self.format_summary(rows, did_fetch, live_now)
+            # Handle live time expiration locally (no fetch needed)
+            expired_live_maps = []
+            for mn in list(self.state.live_until_by_map.keys()):
+                if self.state.live_until_by_map[mn] <= now_ts:
+                    expired_live_maps.append(mn)
+            
+            # Remove expired live maps locally
+            for mn in expired_live_maps:
+                del self.state.live_until_by_map[mn]
+                self.state.live_servers_by_map.pop(mn, None)
+                self.live_map_resync_times.pop(mn, None)
+                self.state.notified_live.discard(mn)  # Clear notification so it can notify again if it goes live
+                logging.debug("Map #%s live time expired locally, removed from live state", mn)
+            
+            # Build live summary from local state only
+            all_live_maps = set()
+            for mn in self.watched:
+                if mn in self.state.live_until_by_map and self.state.live_until_by_map[mn] > now_ts:
+                    all_live_maps.add(mn)
+                    # Notify if newly live (from ETA expiration)
+                    if mn not in self.state.notified_live:
+                        server = self.state.live_servers_by_map.get(mn, set())
+                        server_str = ", ".join(sorted(server)) if server else ""
+                        self.on_live_notification(mn, server_str)
+                        self.state.mark_notified({mn})
+                        logging.debug("KACKY MAP LIVE: #%s on %s", mn, server_str if server_str else "<unknown server>")
+                        # Schedule resync 1 minute after going live
+                        self.live_map_resync_times[mn] = now_ts + 60.0
+                        logging.debug("Scheduled resync for map #%s in 60s", mn)
+            
+            # Format and send summary (use local state, not fetch data)
+            live_summary, tracked_lines = self.format_summary([], False, all_live_maps if all_live_maps else None)
             self.on_summary_update(live_summary, tracked_lines)
+            
+            # Update status
+            if not did_fetch:
+                self.on_status_update("Idle (counting down ETAs)...")
             
             # Reset watchlist trigger
             self.watchlist_added = False
@@ -596,25 +579,14 @@ class KackyWatcher:
     def run(self) -> None:
         """
         Run the watcher in a continuous loop.
+        Simplified: poll every second to handle countdown and fetch triggers.
         """
         while True:
             try:
                 self.poll_once()
                 
-                # Calculate next fetch time dynamically
-                next_fetch_sec = self.calculate_next_fetch_time(time.time())
-                if next_fetch_sec > 0:
-                    # Countdown ETAs during sleep
-                    sleep_interval = 1.0  # Check every second
-                    slept = 0.0
-                    while slept < next_fetch_sec:
-                        time.sleep(sleep_interval)
-                        slept += sleep_interval
-                        # Countdown ETAs by the sleep interval
-                        self.state.countdown_etas(int(sleep_interval))
-                else:
-                    # Immediate fetch needed, don't sleep
-                    pass
+                # Sleep 1 second - poll_once handles countdown internally
+                time.sleep(1.0)
             except KeyboardInterrupt:
                 logging.debug("Exiting...")
                 break

@@ -35,106 +35,106 @@ class WatcherState:
         self.upcoming_by_map: Dict[int, List[Tuple[str, int]]] = {}
         # Remember which watched maps are currently live to avoid repeat notifications
         self.notified_live: Set[int] = set()
-        # Track maps that recently reached 0:00 (cooldown period to exclude from live tab)
-        # Maps are excluded from live display for 5 minutes after reaching 0:00
-        self.recently_finished_by_map: Dict[int, float] = {}
     
     def update_from_fetch(self, rows: List[Dict[str, str]], watched: Set[int]) -> Set[int]:
         """
         Update state from fetched schedule data.
+        ONLY updates times/ETAs - does NOT change live/tracked state.
+        State transitions are handled locally (tracked -> live when ETA hits 0).
         
         Args:
             rows: Parsed schedule rows from HTML
             watched: Set of watched map numbers
             
         Returns:
-            Set of map numbers that are currently live
+            Set of map numbers that are currently live (for reference only)
         """
         now_ts = time.time()
-        live_now: Set[int] = set()
+        live_now: Set[int] = set()  # For reference only
         
-        # Track which maps were live before this update
-        previously_live = set(self.live_until_by_map.keys())
-        
-        # Clear ETA caches
-        self.eta_seconds_by_map.clear()
-        self.server_by_map.clear()
-        self.upcoming_by_map.clear()
+        # Track maps we have local state for
+        maps_with_local_state = set(self.eta_seconds_by_map.keys()) | set(self.live_until_by_map.keys())
         
         for r in rows:
             try:
                 mn = int(r.get("map_number", "0"))
             except ValueError:
                 continue
+            if mn not in watched:
+                continue
             srv = r.get("server", "") or ""
             
             if r.get("is_live"):
-                # Check if map is in cooldown period - if so, ignore it even if website says it's live
-                cooldown_until = self.recently_finished_by_map.get(mn, 0)
-                if cooldown_until > now_ts:
-                    logging.debug("Map #%s is in cooldown period (until %s), ignoring live status from website", mn, cooldown_until - now_ts)
-                    continue  # Skip this map, don't add it to live_now or live_until_by_map
+                remaining_time_str = r.get("remaining_time", "") or ""
+                needs_retry = r.get("needs_retry", False)
                 
-                logging.debug("Map #%s detected as live, adding to live_now", mn)
-                live_now.add(mn)
-                # Only set live window if newly live (not already tracked)
-                if mn not in self.live_until_by_map:
-                    # Use calculated remaining time if available, otherwise use default duration
-                    remaining_time_str = r.get("remaining_time", "") or ""
+                # Skip maps with empty time cells (transitioning) - handle locally
+                if needs_retry and remaining_time_str == "600":
+                    logging.debug("Map #%s has empty time cell (transitioning), skipping time update", mn)
+                    continue
+                
+                # Update live time if map is already live locally
+                if mn in self.live_until_by_map:
                     if remaining_time_str and remaining_time_str.isdigit():
                         remaining_seconds = int(remaining_time_str)
                         self.live_until_by_map[mn] = now_ts + remaining_seconds
+                        logging.debug("Map #%s live time synced: remaining %ds", mn, remaining_seconds)
+                    if srv:
+                        self.live_servers_by_map.setdefault(mn, set()).add(srv)
+                # Only add to live state if we don't have local state for it (new map)
+                elif mn not in maps_with_local_state:
+                    # New map - add to live state
+                    if remaining_time_str and remaining_time_str.isdigit():
+                        remaining_seconds = int(remaining_time_str)
+                        self.live_until_by_map[mn] = now_ts + remaining_seconds
+                        logging.debug("Map #%s added to live state (new map): remaining %ds", mn, remaining_seconds)
                     else:
-                        # Fall back to default duration
                         self.live_until_by_map[mn] = now_ts + self.live_duration_seconds
-                if srv:
-                    self.live_servers_by_map.setdefault(mn, set()).add(srv)
-                # Remove from ETA tracking since it's live on this server
-                self.eta_seconds_by_map.pop(mn, None)
-                self.server_by_map.pop(mn, None)
-                # Only remove upcoming entries for the server where it's live
-                if mn in self.upcoming_by_map and srv:
-                    self.upcoming_by_map[mn] = [(s, t) for s, t in self.upcoming_by_map[mn] if s != srv]
-                    if not self.upcoming_by_map[mn]:
-                        del self.upcoming_by_map[mn]
+                        logging.debug("Map #%s added to live state (new map): default duration", mn)
+                    if srv:
+                        self.live_servers_by_map.setdefault(mn, set()).add(srv)
+                # If map is in tracked (has ETA), don't change state - it will transition locally when ETA hits 0
+                elif mn in self.eta_seconds_by_map:
+                    logging.debug("Map #%s is tracked locally, keeping tracked state (will transition locally)", mn)
+                    # Don't change state - keep it tracked, it will go live when ETA hits 0 locally
+                
+                live_now.add(mn)  # For reference
             else:
-                # Track ETA for upcoming maps
+                # Map is not live on website - update ETA if we have one
                 eta = r.get("eta", "") or ""
                 if eta:
                     m = re.match(r"^(\d{1,2}):(\d{2})$", eta)
                     if m:
                         sec = int(m.group(1)) * 60 + int(m.group(2))
-                        # Store single-earliest summary
-                        if (mn not in self.eta_seconds_by_map) or (sec < self.eta_seconds_by_map[mn]):
+                        
+                        # Update ETA if map is already tracked
+                        if mn in self.eta_seconds_by_map:
+                            # Update to sync time
                             self.eta_seconds_by_map[mn] = sec
                             self.server_by_map[mn] = srv
-                        # Store per-server list
+                            logging.debug("Map #%s ETA synced: %ds", mn, sec)
+                        # Only add to tracked if we don't have local state for it (new map)
+                        elif mn not in maps_with_local_state:
+                            # New map - add to tracked
+                            self.eta_seconds_by_map[mn] = sec
+                            self.server_by_map[mn] = srv
+                            logging.debug("Map #%s added to tracked state (new map): ETA %ds", mn, sec)
+                        
+                        # Update per-server list
                         if srv:
                             self.upcoming_by_map.setdefault(mn, [])
-                            # Keep only earliest per server
                             existing = {s: t for s, t in self.upcoming_by_map[mn]}
                             if (srv not in existing) or (sec < existing[srv]):
-                                # Rebuild list with updated server time
                                 existing[srv] = sec
                                 self.upcoming_by_map[mn] = sorted(existing.items(), key=lambda x: x[1])
+                        
+                        # If map was live, don't remove it - it will transition locally when time expires
+                        # Just update ETA for when it goes live again (or add ETA if it doesn't have one)
+                        if mn in self.live_until_by_map:
+                            logging.debug("Map #%s is live locally, keeping live state (will transition locally)", mn)
+                            # Don't change state - keep it live, it will go to tracked when time expires locally
         
-        # Remove maps from live_until_by_map that are no longer live
-        # (they were live before but aren't in live_now now)
-        no_longer_live = previously_live - live_now
-        for mn in no_longer_live:
-            if mn in self.live_until_by_map:
-                del self.live_until_by_map[mn]
-            if mn in self.live_servers_by_map:
-                del self.live_servers_by_map[mn]
-            # If map just finished (was live but no longer in live_now), mark it for cooldown
-            # Only mark if not already in cooldown (to avoid resetting cooldown timer)
-            if mn not in self.recently_finished_by_map or self.recently_finished_by_map[mn] <= now_ts:
-                self.recently_finished_by_map[mn] = now_ts + 300  # 5 minutes cooldown
-                logging.debug("Map #%s no longer live, removed from live window and starting 5-minute cooldown", mn)
-            else:
-                logging.debug("Map #%s no longer live, removed from live window (already in cooldown)", mn)
-        
-        return live_now
+        return live_now  # For reference only - state is managed locally
     
     def countdown_etas(self, decrement_seconds: int) -> None:
         """
@@ -144,25 +144,14 @@ class WatcherState:
         Args:
             decrement_seconds: How many seconds to subtract from each ETA
         """
-        now_ts = time.time()
         for k in list(self.eta_seconds_by_map.keys()):
-            old_value = self.eta_seconds_by_map[k]
             self.eta_seconds_by_map[k] = max(0, self.eta_seconds_by_map[k] - decrement_seconds)
-            # If ETA just reached 0, mark map as recently finished (5 minute cooldown)
-            if old_value > 0 and self.eta_seconds_by_map[k] == 0:
-                self.recently_finished_by_map[k] = now_ts + 300  # 5 minutes cooldown
-                logging.debug("Map #%s reached 0:00, starting 5-minute cooldown period", k)
         
         for mn, items in list(self.upcoming_by_map.items()):
             updated = []
             for s, t in items:
-                old_t = t
                 new_t = max(0, t - decrement_seconds)
                 updated.append((s, new_t))
-                # If ETA just reached 0, mark map as recently finished
-                if old_t > 0 and new_t == 0:
-                    self.recently_finished_by_map[mn] = now_ts + 300  # 5 minutes cooldown
-                    logging.debug("Map #%s reached 0:00 on server %s, starting 5-minute cooldown period", mn, s)
             self.upcoming_by_map[mn] = updated
     
     def cleanup_expired_live_windows(self, now_ts: float) -> None:
@@ -176,16 +165,6 @@ class WatcherState:
             if self.live_until_by_map[mn] <= now_ts:
                 del self.live_until_by_map[mn]
                 self.live_servers_by_map.pop(mn, None)
-                # Mark map for cooldown when its live window expires
-                # Only mark if not already in cooldown (to avoid resetting cooldown timer)
-                if mn not in self.recently_finished_by_map or self.recently_finished_by_map[mn] <= now_ts:
-                    self.recently_finished_by_map[mn] = now_ts + 300  # 5 minutes cooldown
-                    logging.debug("Map #%s live window expired, marking for 5-minute cooldown", mn)
-        
-        # Clean up expired cooldown entries
-        for mn in list(self.recently_finished_by_map.keys()):
-            if self.recently_finished_by_map[mn] <= now_ts:
-                del self.recently_finished_by_map[mn]
     
     def get_live_summary(self, watched: Set[int], live_now: Set[int], now_ts: float) -> List[int]:
         """
@@ -211,24 +190,13 @@ class WatcherState:
                 if mn not in live_now:
                     del self.live_until_by_map[mn]
                     self.live_servers_by_map.pop(mn, None)
-            # Filter out maps in cooldown period (recently finished)
             # If a map is in live_now (from recent fetch), it's currently live on the website
-            # We only need to check cooldown, not live window (since live_now is source of truth)
-            live_summary = []
-            for mn in sorted(live_now & watched):
-                cooldown_until = self.recently_finished_by_map.get(mn, 0)
-                if cooldown_until <= now_ts:
-                    live_summary.append(mn)
-                else:
-                    logging.debug("Map #%s in live_now but filtered out due to cooldown (until %s)", mn, cooldown_until - now_ts)
-            live_summary = sorted(live_summary)
+            live_summary = sorted(live_now & watched)
         else:
             # No recent fetch: use live windows for persistence
             for mn in sorted(watched):
                 if mn in self.live_until_by_map and self.live_until_by_map[mn] > now_ts:
-                    # Exclude maps in cooldown period
-                    if self.recently_finished_by_map.get(mn, 0) <= now_ts:
-                        live_summary.append(mn)
+                    live_summary.append(mn)
         
         return live_summary
     
