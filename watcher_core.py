@@ -467,9 +467,12 @@ class KackyWatcher:
                         else:
                             self.consecutive_fetch_failures += 1
                             if self.consecutive_fetch_failures >= 2:
-                                time_since_success = now_ts - self.last_successful_fetch_time if self.last_successful_fetch_time > 0 else float('inf')
-                                if time_since_success > 60:
-                                    self.on_status_update(f"⚠️ Website unreachable or returned no data (last success: {int(time_since_success)}s ago)")
+                                if self.last_successful_fetch_time > 0:
+                                    time_since_success = now_ts - self.last_successful_fetch_time
+                                    if time_since_success > 60:
+                                        self.on_status_update(f"⚠️ Website unreachable or returned no data (last success: {int(time_since_success)}s ago)")
+                                    else:
+                                        self.on_status_update("⚠️ Website unreachable or returned no data")
                                 else:
                                     self.on_status_update("⚠️ Website unreachable or returned no data")
                     except Exception as e:
