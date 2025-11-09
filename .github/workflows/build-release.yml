@@ -4,12 +4,14 @@ on:
   push:
     branches:
       - main
+      - testBranch  # Test branch - builds artifact but doesn't create release
+  workflow_dispatch:  # Allow manual triggering from Actions tab
 
 jobs:
   build:
     runs-on: windows-latest
     permissions:
-      contents: write  # Required to create releases and tags
+      contents: write  # Required to create releases and tags (only used on main)
     
     steps:
     - name: Checkout code
@@ -42,6 +44,13 @@ jobs:
       run: |
         Compress-Archive -Path "dist/KackyWatcher/*" -DestinationPath "dist/KackyWatcher.zip" -Force
     
+    - name: Upload artifact (available for all builds)
+      uses: actions/upload-artifact@v4
+      with:
+        name: KackyWatcher-EXE
+        path: dist/KackyWatcher.zip
+        retention-days: 7  # Keep artifact for 7 days
+    
     - name: Get version from git
       id: version
       run: |
@@ -52,7 +61,8 @@ jobs:
         echo "version=$version" >> $env:GITHUB_OUTPUT
         echo "Created version: $version"
     
-    - name: Create Release
+    - name: Create Release (main branch only)
+      if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
       uses: softprops/action-gh-release@v1
       with:
         files: dist/KackyWatcher.zip
