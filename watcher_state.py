@@ -7,6 +7,9 @@ import time
 import re
 from typing import Dict, List, Set, Tuple, Optional
 
+from map_status_manager import get_server_uptimes
+from path_utils import get_map_status_file
+
 
 class WatcherState:
     """
@@ -37,7 +40,7 @@ class WatcherState:
         self.notified_live: Set[int] = set()
         
         # Server uptime tracking (in seconds, always full minutes)
-        # Initialize with known defaults:
+        # Initialize with known defaults, then load persisted values if available
         # Servers 1-4: 10 minutes (600 seconds)
         # Servers 5-8: 13 minutes (780 seconds)
         # Servers 9-10: 15 minutes (900 seconds)
@@ -48,6 +51,18 @@ class WatcherState:
             self.server_uptime_seconds[f"Server {server_num}"] = 780  # 13 minutes
         for server_num in range(9, 11):
             self.server_uptime_seconds[f"Server {server_num}"] = 900  # 15 minutes
+        
+        # Load persisted server uptimes from file (overrides defaults)
+        try:
+            persisted_uptimes = get_server_uptimes(get_map_status_file())
+            if persisted_uptimes:
+                # Only update if we have valid persisted values
+                for server, uptime in persisted_uptimes.items():
+                    if isinstance(uptime, int) and uptime > 0:
+                        self.server_uptime_seconds[server] = uptime
+                logging.debug("Loaded persisted server uptimes: %s", persisted_uptimes)
+        except Exception as e:
+            logging.debug("Could not load persisted server uptimes: %s", e)
     
     def update_from_fetch(self, rows: List[Dict[str, str]], watched: Set[int]) -> Set[int]:
         """
@@ -92,13 +107,8 @@ class WatcherState:
                     live_now.add(mn)
                     continue
                 
-                # Update server uptime knowledge from observed data (only if we have real data)
-                if remaining_time_str and remaining_time_str.isdigit():
-                    remaining_seconds = int(remaining_time_str)
-                    # Learn server uptime from observed remaining time
-                    # Maps that just went live have close to full uptime
-                    if remaining_seconds > 0:
-                        self.update_server_uptime(srv, remaining_seconds)
+                # Server uptime learning is now handled by Maps view fetching
+                # (see watcher_core.fetch_and_update_server_uptimes)
                 
                 # Update live time if map is already live locally
                 if mn in self.live_until_by_map:
@@ -386,47 +396,6 @@ class WatcherState:
             return None
         return min(candidates)
     
-    def update_server_uptime(self, server: str, observed_remaining_time: int) -> None:
-        """
-        Update server uptime based on observed remaining time.
-        Uptimes are always full minutes (10, 12, 15, etc.), so we learn from maps that
-        just went live (which have close to full uptime remaining).
-        
-        Args:
-            server: Server label (e.g., "Server 1")
-            observed_remaining_time: Observed remaining time in seconds
-        """
-        if not server or observed_remaining_time <= 0:
-            return
-        
-        # Convert to minutes (rounding to nearest)
-        observed_minutes_float = observed_remaining_time / 60.0
-        observed_minutes = round(observed_minutes_float)
-        observed_seconds = observed_minutes * 60
-        
-        current_uptime = self.server_uptime_seconds.get(server, 600)
-        current_minutes = current_uptime // 60
-        
-        # Only update if:
-        # 1. Observed time is within 30 seconds of a full minute (maps start with ~full uptime)
-        # 2. The rounded minutes value is close to or higher than current uptime
-        # 3. Observed time is at least 95% of current uptime (to avoid updates from mid-cycle observations)
-        
-        time_diff_from_full_minute = abs(observed_seconds - observed_remaining_time)
-        
-        # Check if observed time is close to a full minute (within 30 seconds)
-        is_close_to_full_minute = time_diff_from_full_minute <= 30
-        
-        # Check if this looks like a map that just went live (high remaining time)
-        is_high_remaining_time = observed_remaining_time >= current_uptime * 0.95
-        
-        if is_close_to_full_minute and (observed_seconds >= current_uptime or is_high_remaining_time):
-            # Only update if the new value is higher, or if it's very close to current (within 1 minute)
-            if observed_seconds > current_uptime or (observed_seconds >= current_uptime * 0.95 and observed_seconds <= current_uptime * 1.05):
-                self.server_uptime_seconds[server] = observed_seconds
-                logging.debug("Updated server %s uptime to %d seconds (%d minutes) (observed %d seconds, %.1f minutes)", 
-                             server, observed_seconds, observed_minutes, observed_remaining_time, observed_minutes_float)
-    
     def get_server_uptime(self, server: str) -> int:
         """
         Get uptime for a server, falling back to default if unknown.
@@ -440,4 +409,55 @@ class WatcherState:
         if not server:
             return 600  # Default fallback
         return self.server_uptime_seconds.get(server, 600)
+    
+    def update_server_uptimes_from_maps_view(self, server_uptimes: Dict[str, int]) -> bool:
+        """
+        Update server uptimes from Maps view data.
+        This is the primary method for learning server uptimes.
+        
+        Args:
+            server_uptimes: Dictionary of server -> uptime in seconds (from Maps view calculation)
+            
+        Returns:
+            True if any uptimes were updated
+        """
+        updated = False
+        for server, uptime_seconds in server_uptimes.items():
+            if not server or uptime_seconds <= 0:
+                continue
+            
+            current_uptime = self.server_uptime_seconds.get(server)
+            # Update if different (Maps view is authoritative)
+            if current_uptime != uptime_seconds:
+                old_uptime = current_uptime
+                self.server_uptime_seconds[server] = uptime_seconds
+                updated = True
+                logging.debug("Updated server %s uptime from Maps view: %ds -> %ds (%d minutes)", 
+                             server, old_uptime if old_uptime else 0, uptime_seconds, uptime_seconds // 60)
+        
+        if updated:
+            self._save_server_uptimes()
+        
+        return updated
+    
+    def _save_server_uptimes(self) -> None:
+        """
+        Save server uptimes to map_status.json file.
+        This is called automatically when server uptimes are updated.
+        """
+        try:
+            from map_status_manager import load_map_status, save_map_status
+            from path_utils import get_map_status_file
+            
+            status_path = get_map_status_file()
+            # Load existing data to preserve tracking/finished maps
+            existing_data = load_map_status(status_path)
+            tracking = existing_data.get("tracking", set())
+            finished = existing_data.get("finished", set())
+            
+            # Save with updated server uptimes
+            save_map_status(tracking, finished, status_path, self.server_uptime_seconds)
+            logging.debug("Saved server uptimes to %s", status_path)
+        except Exception as e:
+            logging.debug("Could not save server uptimes: %s", e)
 

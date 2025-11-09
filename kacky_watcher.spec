@@ -44,6 +44,7 @@ a = Analysis(
         'watcher_state',
         'schedule_fetcher',
         'schedule_parser',
+        'schedule_parser_maps',
     ],
     hookspath=[],
     hooksconfig={},

@@ -38,7 +38,7 @@ def fetch_schedule_html(user_agent: Optional[str] = None, timeout: int = 10) -> 
     return resp.text
 
 
-def fetch_schedule_html_browser(timeout: int = 20, user_agent: Optional[str] = None) -> str:
+def fetch_schedule_html_browser(timeout: int = 20, user_agent: Optional[str] = None, view: str = "servers") -> str:
     """
     Fetch schedule HTML using headless browser (Playwright).
     Used when site requires client-side rendering.
@@ -46,6 +46,7 @@ def fetch_schedule_html_browser(timeout: int = 20, user_agent: Optional[str] = N
     Args:
         timeout: Page load timeout in seconds
         user_agent: Optional User-Agent string
+        view: Which view to fetch - "servers" (default) or "maps"
         
     Returns:
         HTML content as string
@@ -57,7 +58,7 @@ def fetch_schedule_html_browser(timeout: int = 20, user_agent: Optional[str] = N
     if not PLAYWRIGHT_AVAILABLE:
         raise ImportError("Playwright not available. Install with: pip install playwright && python -m playwright install")
     
-    logging.debug("Starting Playwright browser fetch...")
+    logging.debug("Starting Playwright browser fetch... (view: %s)", view)
     logging.debug("PLAYWRIGHT_AVAILABLE: %s", PLAYWRIGHT_AVAILABLE)
     logging.debug("Timeout: %d seconds", timeout)
     
@@ -97,6 +98,27 @@ def fetch_schedule_html_browser(timeout: int = 20, user_agent: Optional[str] = N
                 # If table was found quickly, give JS a moment to finish rendering data
                 if table_found:
                     page.wait_for_timeout(500)  # Brief wait to ensure data is populated
+                
+                # Switch to Maps view if requested
+                if view == "maps":
+                    logging.debug("Switching to Maps view...")
+                    try:
+                        # Find and click the "Maps" button
+                        # Button structure: <button>Maps</button> in the tab switcher
+                        maps_button = page.locator("button:has-text('Maps')").first
+                        if maps_button.is_visible(timeout=2000):
+                            # Click the button
+                            maps_button.click()
+                            logging.debug("Clicked Maps button")
+                            # Wait for the table to update (wait for any table changes)
+                            page.wait_for_timeout(1500)  # Wait for view to update and data to load
+                            # Verify we're in Maps view by checking if table structure changed
+                            # (The table should still exist, but content should be different)
+                            logging.debug("Maps view should be loaded")
+                        else:
+                            logging.warning("Maps button not found, using default view")
+                    except Exception as e:
+                        logging.warning("Failed to switch to Maps view: %s, using default view", e)
                 
                 logging.debug("Getting page content...")
                 html = page.content()

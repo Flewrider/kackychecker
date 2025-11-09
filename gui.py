@@ -691,7 +691,12 @@ class KackyWatcherGUI:
                 finished.add(map_num)
         
         try:
-            save_map_status(tracking, finished, self.status_file)
+            # Also save server uptimes if watcher state is available
+            server_uptimes = None
+            if hasattr(self, 'watcher') and self.watcher and hasattr(self.watcher.state, 'server_uptime_seconds'):
+                server_uptimes = self.watcher.state.server_uptime_seconds
+            
+            save_map_status(tracking, finished, self.status_file, server_uptimes)
             self.update_status("Map status saved")
         except Exception as e:
             self.update_status(f"Error saving map status: {e}")
