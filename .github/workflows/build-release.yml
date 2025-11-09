@@ -19,6 +19,14 @@ jobs:
       with:
         fetch-depth: 0  # Fetch full history for git describe to work properly
         fetch-tags: true  # Fetch all tags so git describe can find them
+        clean: true  # Ensure clean checkout to avoid case-sensitivity conflicts
+    
+    - name: Configure Git for case-insensitive filesystem
+      run: |
+        # Configure Git to handle case-insensitive filesystem (Windows)
+        git config --global core.ignorecase true
+        git config --global core.precomposeunicode false
+        # This helps prevent case-sensitivity warnings during git operations
     
     - name: Set up Python
       uses: actions/setup-python@v5
