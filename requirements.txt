@@ -1,7 +1,7 @@
 requests==2.32.3
 beautifulsoup4==4.12.3
 greenlet>=3.0.0,<4.0.0
-playwright==1.47.0
+playwright>=1.49.0,<2.0.0
 pytest==8.3.3
 win10toast==0.9
 

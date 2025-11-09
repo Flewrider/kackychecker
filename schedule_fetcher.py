@@ -65,6 +65,9 @@ def fetch_schedule_html_browser(timeout: int = 20, user_agent: Optional[str] = N
         logging.debug("Creating Playwright context...")
         with sync_playwright() as p:
             logging.debug("Launching Chromium browser...")
+            # Launch browser - Playwright 1.48.0+ automatically uses new headless mode
+            # Note: Playwright 1.47.0 uses old headless mode which newer Chromium doesn't support
+            # This EXE needs to be rebuilt with Playwright 1.49.0+ to work with newer Chromium versions
             browser = p.chromium.launch(headless=True)
             logging.debug("Browser launched successfully")
             try:

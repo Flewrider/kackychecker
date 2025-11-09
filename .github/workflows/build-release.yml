@@ -39,16 +39,16 @@ jobs:
         New-Item -ItemType Directory -Force -Path "dist/KackyWatcher"
         Copy-Item "dist/KackyWatcher.exe" "dist/KackyWatcher/"
         # Note: Only the EXE is bundled. Playwright browsers are installed on first run.
-    
-    - name: Create zip archive
+
+    - name: Create zip archive (for releases)
       run: |
         Compress-Archive -Path "dist/KackyWatcher/*" -DestinationPath "dist/KackyWatcher.zip" -Force
-    
+
     - name: Upload artifact (available for all builds)
       uses: actions/upload-artifact@v4
       with:
         name: KackyWatcher-EXE
-        path: dist/KackyWatcher.zip
+        path: dist/KackyWatcher/  # Upload directory directly - GitHub Actions will zip it automatically
         retention-days: 7  # Keep artifact for 7 days
     
     - name: Get version from git
