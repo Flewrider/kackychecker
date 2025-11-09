@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write  # Required to create releases and tags
     
     steps:
     - name: Checkout code
@@ -23,11 +25,8 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install pyinstaller
-    
-    - name: Install Playwright browsers
-      run: |
-        python -m playwright install chromium
-        python -m playwright install-deps chromium
+        # Note: Playwright Python package is installed and will be bundled in EXE
+        # Browsers are NOT bundled - they are installed on first run by the user
     
     - name: Build EXE with PyInstaller
       run: |
@@ -37,11 +36,7 @@ jobs:
       run: |
         New-Item -ItemType Directory -Force -Path "dist/KackyWatcher"
         Copy-Item "dist/KackyWatcher.exe" "dist/KackyWatcher/"
-        # Note: Playwright browsers will be in the dist folder from PyInstaller
-        # If they're in a subdirectory, copy them too
-        if (Test-Path "dist/playwright") {
-          Copy-Item -Recurse "dist/playwright" "dist/KackyWatcher/"
-        }
+        # Note: Only the EXE is bundled. Playwright browsers are installed on first run.
     
     - name: Create zip archive
       run: |
@@ -69,7 +64,8 @@ jobs:
           **Installation:**
           1. Download and extract `KackyWatcher.zip`
           2. Run `KackyWatcher.exe`
-          3. Files (`settings.json`, `watchlist.txt`, `map_status.json`) will be created automatically on first run
+          3. The app will prompt you to install Playwright browsers on first run (required, ~100-200MB download)
+          4. Files (`settings.json`, `watchlist.txt`, `map_status.json`) will be created automatically on first run
         draft: false
         prerelease: false
       env:
