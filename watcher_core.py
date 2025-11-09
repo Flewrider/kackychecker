@@ -53,6 +53,8 @@ class KackyWatcher:
         self.last_fetch_time = 0.0  # Track when we last fetched to prevent rapid refetches
         self.last_successful_fetch_time = 0.0  # Track when we last successfully fetched data
         self.consecutive_fetch_failures = 0  # Track consecutive fetch failures
+        self.maps_needing_retry: Set[int] = set()  # Maps that are live but need a retry fetch (transitioning)
+        self.retry_scheduled_time: float = 0.0  # When to retry fetching for transitioning maps
         self.watched: Set[int] = get_tracking_maps(self.status_file)
         
         if not self.watched:
@@ -370,7 +372,14 @@ class KackyWatcher:
             
             # Decide if we should fetch
             now_ts = time.time()
-            if force_fetch:
+            
+            # Check if it's time to retry fetching for transitioning maps (priority check)
+            if not force_fetch and self.maps_needing_retry and now_ts >= self.retry_scheduled_time:
+                should_fetch = True
+                fetch_reason = "retry_transitioning"
+                triggering_maps = []
+                logging.debug("Retry fetch triggered for transitioning maps: %s", sorted(self.maps_needing_retry))
+            elif force_fetch:
                 should_fetch = True
                 fetch_reason = "forced"
                 triggering_maps = []
@@ -384,14 +393,17 @@ class KackyWatcher:
                 # Prevent rapid refetches - enforce minimum time between fetches (except for immediate triggers)
                 min_fetch_interval = 2.0  # Minimum 2 seconds between fetches
                 if now_ts - self.last_fetch_time < min_fetch_interval:
-                    # Skip fetch if too soon (unless it's a critical reason or forced)
-                    if fetch_reason not in ("watchlist_added", "initial", "forced"):
+                    # Skip fetch if too soon (unless it's a critical reason, forced, or retry)
+                    if fetch_reason not in ("watchlist_added", "initial", "forced", "retry_transitioning"):
                         should_fetch = False
                         logging.debug("Skipping fetch (too soon after last fetch: %.1fs)", now_ts - self.last_fetch_time)
                 
                 if should_fetch:
                     # Log fetch reason
-                    if fetch_reason == "initial":
+                    if fetch_reason == "retry_transitioning":
+                        logging.debug("Fetching schedule (reason: retry for transitioning maps)")
+                        self.on_status_update(f"Retrying fetch for transitioning maps...")
+                    elif fetch_reason == "initial":
                         logging.debug("Fetching schedule (reason: initial state)")
                         self.on_status_update("Fetching schedule (initial state)...")
                     elif fetch_reason == "watchlist_added":
@@ -527,6 +539,30 @@ class KackyWatcher:
             
             # Update state and get live maps
             if did_fetch:
+                # Clear retry flags if this was a retry fetch
+                if fetch_reason == "retry_transitioning":
+                    self.maps_needing_retry.clear()
+                    self.retry_scheduled_time = 0.0
+                    logging.debug("Retry fetch completed, cleared retry flags")
+                
+                # Check for maps that need retry (transitioning maps with empty time cells)
+                maps_to_retry = set()
+                for r in rows:
+                    if r.get("is_live") and r.get("needs_retry", False):
+                        try:
+                            mn = int(r.get("map_number", "0"))
+                            if mn > 0:
+                                maps_to_retry.add(mn)
+                        except ValueError:
+                            pass
+                
+                if maps_to_retry and self.retry_scheduled_time == 0.0:
+                    # Schedule retry in 8 seconds for transition to complete
+                    retry_delay = 8.0
+                    self.retry_scheduled_time = now_ts + retry_delay
+                    self.maps_needing_retry = maps_to_retry
+                    logging.debug("Scheduled retry in %.1fs for transitioning maps: %s", retry_delay, sorted(maps_to_retry))
+                
                 live_now = self.state.update_from_fetch(rows, self.watched)
                 
                 # Notify for newly live maps
