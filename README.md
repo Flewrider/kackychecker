@@ -2,6 +2,8 @@
 
 A Windows desktop application that monitors the [Kacky schedule](https://kacky.gg/schedule) and notifies you when your watched maps go live. Built with Python and Tkinter, packaged as a standalone EXE.
 
+THIS HAS BEEN MADE WITH AI.
+
 ## Features
 
 - **Real-time Monitoring**: Tracks map schedules across multiple servers
@@ -19,7 +21,7 @@ A Windows desktop application that monitors the [Kacky schedule](https://kacky.g
    - Go to [Releases](https://github.com/flewrider/kackychecker/releases)
    - Download the latest `KackyWatcher.zip`
    - Extract the zip file
-   - Run `KackyWatcher.exe`
+   - Run `KackyWatcher.exe` inside any folder (Creates Files)
 
 2. **First Run Setup**
    - On first launch, the app will prompt you to install Playwright browsers (required)
