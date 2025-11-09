@@ -361,22 +361,43 @@ def install_browsers() -> tuple[bool, Optional[str]]:
                 except Exception as e:
                     logging.debug(f"Could not determine expected version: {e}")
                 
-                # Find system Python
+                # Find system Python - prefer pythonw.exe to avoid console window
                 import shutil
                 python_exe = None
-                for python_cmd in ["python", "python3", "py"]:
-                    python_exe = shutil.which(python_cmd)
-                    if python_exe:
-                        logging.debug(f"Found Python at: {python_exe}")
+                pythonw_exe = None
+                
+                # First, try to find pythonw.exe directly in PATH (no console window)
+                for pythonw_cmd in ["pythonw", "pythonw3"]:
+                    pythonw_exe = shutil.which(pythonw_cmd)
+                    if pythonw_exe:
+                        logging.debug(f"Found Pythonw in PATH at: {pythonw_exe}")
                         break
                 
-                if not python_exe:
+                # If pythonw not found in PATH, find python.exe and look for pythonw.exe in same directory
+                if not pythonw_exe:
+                    for python_cmd in ["python", "python3", "py"]:
+                        python_exe = shutil.which(python_cmd)
+                        if python_exe:
+                            logging.debug(f"Found Python at: {python_exe}")
+                            # Try to find pythonw.exe in the same directory
+                            python_dir = os.path.dirname(python_exe)
+                            pythonw_path = os.path.join(python_dir, "pythonw.exe")
+                            if os.path.exists(pythonw_path):
+                                pythonw_exe = pythonw_path
+                                logging.debug(f"Found Pythonw in same directory at: {pythonw_exe}")
+                            break
+                
+                if not python_exe and not pythonw_exe:
                     logging.error("System Python not found. Cannot install Playwright browsers.")
                     return False, "Python is required to install Playwright browsers. Please install Python and run: python -m playwright install chromium"
                 
-                # Use subprocess with found Python
-                python_cmd = python_exe
-                logging.debug(f"Installing browsers via system Python at {python_cmd}...")
+                # Prefer pythonw to avoid console window, fall back to python if not available
+                python_cmd = pythonw_exe if pythonw_exe else python_exe
+                if pythonw_exe:
+                    logging.debug(f"Installing browsers via Pythonw (no console window) at {python_cmd}...")
+                else:
+                    logging.warning(f"Pythonw not found - using Python (console window will appear) at {python_cmd}...")
+                    logging.debug("Note: Install pythonw.exe to avoid console window during browser installation")
                 
                 try:
                     # Install browsers using system Python's Playwright

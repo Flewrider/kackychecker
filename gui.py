@@ -595,13 +595,19 @@ class KackyWatcherGUI:
                                 browsers_now_installed = check_browsers_installed()
                                 logging.debug(f"Re-check after installation: {browsers_now_installed}")
                                 
+                                # Trigger immediate fetch after successful installation
+                                # This ensures the user doesn't have to wait for the scheduled refetch
+                                logging.debug("Triggering immediate fetch after browser installation...")
+                                self.immediate_fetch_event.set()
+                                
                                 def show_success(verified=browsers_now_installed):
                                     try:
                                         if verified:
                                             messagebox.showinfo(
                                                 "Installation Complete",
                                                 "Playwright browsers installed successfully!\n"
-                                                "The application can now fetch schedule data."
+                                                "The application can now fetch schedule data.\n\n"
+                                                "Fetching schedule data now..."
                                             )
                                         else:
                                             messagebox.showwarning(
