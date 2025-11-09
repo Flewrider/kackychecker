@@ -54,6 +54,17 @@ class KackyWatcherGUI:
         setup_logging(self.config["LOG_LEVEL"])
         print("Config and logging complete")
         
+        # CRITICAL: Set Playwright browsers path BEFORE any Playwright imports or operations
+        # This must happen early to ensure Playwright can find browsers installed by system Python
+        # Must be before check_and_install_playwright() or any code that imports Playwright
+        try:
+            from playwright_installer import _ensure_browsers_path_set
+            _ensure_browsers_path_set()
+            logging.debug("Set Playwright browsers path at GUI startup (before any Playwright operations)")
+        except Exception as e:
+            # Log but don't fail - this is best effort
+            logging.debug(f"Could not ensure browsers path at startup: {e}", exc_info=True)
+        
         # Map status file path
         self.status_file = get_map_status_file()
         
@@ -107,14 +118,8 @@ class KackyWatcherGUI:
             # Initialize default files on first run
             self.initialize_default_files()
             
-            # Ensure browsers path is set (for EXE mode to find system-installed browsers)
-            try:
-                from playwright_installer import _ensure_browsers_path_set
-                _ensure_browsers_path_set()
-            except Exception as e:
-                logging.debug(f"Could not ensure browsers path: {e}")
-            
             # Check and install Playwright browsers if needed
+            # Note: _ensure_browsers_path_set() was already called at the start of __init__
             self.check_and_install_playwright()
             
             self.load_map_status()

@@ -68,12 +68,13 @@ def main():
         sys.exit(1)
     
     print(f"\n✓ Build successful! EXE created at: {exe_path.absolute()}")
-    print("\nNote: Playwright browsers may need to be installed separately.")
-    print("The EXE will attempt to use Playwright if available, otherwise it will fall back to HTTP requests.")
+    print("\nNote: Playwright browsers are NOT bundled in the EXE.")
+    print("The app will prompt users to install Playwright browsers on first run (~100-200MB download).")
     print("\nTo test the EXE:")
     print(f"  1. Navigate to: {exe_path.parent.absolute()}")
     print("  2. Run: KackyWatcher.exe")
-    print("  3. Check that settings.json, watchlist.txt, and map_status.json are created in the same directory")
+    print("  3. The app will prompt you to install Playwright browsers (required)")
+    print("  4. Check that settings.json, watchlist.txt, and map_status.json are created in the same directory")
 
 
 if __name__ == "__main__":

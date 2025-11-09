@@ -13,9 +13,16 @@ def _ensure_browsers_path_set() -> None:
     """
     Ensure PLAYWRIGHT_BROWSERS_PATH is set if browsers are installed in system location.
     This helps EXE find browsers installed by system Python.
+    MUST be called BEFORE any Playwright imports to ensure Playwright uses the correct path.
+    
+    This function is safe to call even if logging is not yet configured.
     """
     # Only set if not already set
     if os.getenv("PLAYWRIGHT_BROWSERS_PATH"):
+        try:
+            logging.debug(f"PLAYWRIGHT_BROWSERS_PATH already set to: {os.getenv('PLAYWRIGHT_BROWSERS_PATH')}")
+        except Exception:
+            pass  # Logging not configured yet, that's okay
         return
     
     # Check common locations where system Python installs Playwright browsers
@@ -36,13 +43,91 @@ def _ensure_browsers_path_set() -> None:
     
     # Check if any of these paths contain chromium
     for path in possible_paths:
-        chromium_path = path / "chromium-*" / "chrome-win" / "chrome.exe"
+        if not path.exists():
+            try:
+                logging.debug(f"Checking browser path (does not exist): {path}")
+            except Exception:
+                pass
+            continue
+        
         # Use glob to find any chromium version
         chromium_matches = list(path.glob("chromium-*/chrome-win/chrome.exe"))
         if chromium_matches:
-            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(path)
-            logging.debug(f"Set PLAYWRIGHT_BROWSERS_PATH to: {path} (found browsers)")
-            return
+            # Verify the chromium executable actually exists
+            for chromium_exe in chromium_matches:
+                if chromium_exe.exists() and chromium_exe.is_file():
+                    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(path)
+                    try:
+                        logging.debug(f"Set PLAYWRIGHT_BROWSERS_PATH to: {path} (found browsers at {chromium_exe})")
+                    except Exception:
+                        pass
+                    return
+                else:
+                    try:
+                        logging.debug(f"Chromium executable path exists in glob but file not found: {chromium_exe}")
+                    except Exception:
+                        pass
+    
+    try:
+        logging.debug("No Playwright browsers found in common locations, PLAYWRIGHT_BROWSERS_PATH not set")
+    except Exception:
+        pass
+
+
+# CRITICAL: Set browsers path at module import time if running in EXE mode
+# This ensures the path is set BEFORE any Playwright imports in other modules
+# (like schedule_fetcher.py which imports Playwright at module level)
+# This is safe because _ensure_browsers_path_set() doesn't require logging to be configured
+_is_exe = getattr(sys, 'frozen', False)
+if _is_exe:
+    try:
+        _ensure_browsers_path_set()
+    except Exception:
+        # Silently fail at module import time - we'll call it again later when logging is set up
+        # The important thing is we tried to set the path early
+        pass
+
+
+def _find_and_set_installed_browser_path() -> Optional[str]:
+    """
+    Find where Playwright browsers are actually installed and set PLAYWRIGHT_BROWSERS_PATH.
+    This should be called after installation to ensure the path is set correctly.
+    
+    Returns:
+        Path where browsers were found, or None if not found
+    """
+    from pathlib import Path
+    
+    # Check common installation locations
+    possible_paths = []
+    
+    # User's AppData (most common on Windows)
+    appdata = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA")
+    if appdata:
+        possible_paths.append(Path(appdata) / "ms-playwright")
+    
+    # User's home directory
+    home = os.getenv("USERPROFILE") or os.getenv("HOME")
+    if home:
+        possible_paths.append(Path(home) / ".cache" / "ms-playwright")
+        possible_paths.append(Path(home) / ".local" / "share" / "ms-playwright")
+    
+    # Check each path for chromium
+    for path in possible_paths:
+        if not path.exists():
+            continue
+        
+        # Look for chromium installation
+        chromium_matches = list(path.glob("chromium-*/chrome-win/chrome.exe"))
+        for chromium_exe in chromium_matches:
+            if chromium_exe.exists() and chromium_exe.is_file():
+                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(path)
+                logging.debug(f"Found installed browsers at: {path} (chromium at {chromium_exe})")
+                logging.debug(f"Set PLAYWRIGHT_BROWSERS_PATH to: {path}")
+                return str(path)
+    
+    logging.debug("Could not find installed browser path after installation")
+    return None
 
 
 def check_browsers_installed() -> bool:
@@ -52,40 +137,47 @@ def check_browsers_installed() -> bool:
     Returns:
         True if browsers are installed, False otherwise
     """
-    # First, try to set the browsers path if needed (for EXE mode)
+    # CRITICAL: Set browsers path BEFORE importing Playwright
+    # Playwright determines browser locations when it's imported, so we must set
+    # PLAYWRIGHT_BROWSERS_PATH before any Playwright imports
     try:
         _ensure_browsers_path_set()
+        logging.debug(f"After _ensure_browsers_path_set(), PLAYWRIGHT_BROWSERS_PATH={os.getenv('PLAYWRIGHT_BROWSERS_PATH')}")
     except Exception as e:
-        logging.debug(f"Could not set browsers path: {e}")
+        logging.debug(f"Could not set browsers path: {e}", exc_info=True)
     
     try:
+        # Now import Playwright - it will use the PLAYWRIGHT_BROWSERS_PATH we just set
         from playwright.sync_api import sync_playwright
+        logging.debug("Playwright imported, checking browser installation...")
+        
         with sync_playwright() as p:
             try:
                 # Try to get the browser path - if it exists, browsers are installed
                 browser_path = p.chromium.executable_path
-                logging.debug(f"Chromium executable path: {browser_path}")
+                logging.debug(f"Chromium executable path from Playwright: {browser_path}")
                 if browser_path and os.path.exists(browser_path):
                     logging.debug(f"Browsers found at: {browser_path}")
                     return True
                 else:
-                    logging.debug(f"Browser path doesn't exist: {browser_path}")
+                    logging.debug(f"Browser path from Playwright doesn't exist: {browser_path}")
             except Exception as e:
-                logging.debug(f"Error getting browser path: {e}")
+                logging.debug(f"Error getting browser path: {e}", exc_info=True)
                 # Try to actually launch to see if it works
                 try:
+                    logging.debug("Attempting to launch browser to verify installation...")
                     browser = p.chromium.launch(headless=True)
                     browser.close()
                     logging.debug("Browsers are installed (launch test succeeded)")
                     return True
                 except Exception as launch_err:
-                    logging.debug(f"Browser launch test failed: {launch_err}")
+                    logging.debug(f"Browser launch test failed: {launch_err}", exc_info=True)
         return False
     except ImportError:
-        logging.debug("Playwright not imported")
+        logging.debug("Playwright not imported (ImportError)")
         return False
     except Exception as e:
-        logging.debug(f"Error checking Playwright browsers: {e}")
+        logging.debug(f"Error checking Playwright browsers: {e}", exc_info=True)
         return False
 
 
@@ -97,6 +189,16 @@ def install_browsers() -> tuple[bool, Optional[str]]:
         Tuple of (success: bool, error_message: Optional[str])
     """
     logging.debug("=== install_browsers() called ===")
+    logging.debug(f"Current PLAYWRIGHT_BROWSERS_PATH: {os.getenv('PLAYWRIGHT_BROWSERS_PATH')}")
+    
+    # CRITICAL: Set browsers path BEFORE any Playwright imports or operations
+    # This ensures Playwright knows where to look for/install browsers
+    try:
+        _ensure_browsers_path_set()
+        logging.debug(f"After _ensure_browsers_path_set(), PLAYWRIGHT_BROWSERS_PATH: {os.getenv('PLAYWRIGHT_BROWSERS_PATH')}")
+    except Exception as e:
+        logging.debug(f"Could not ensure browsers path before installation: {e}", exc_info=True)
+    
     try:
         # Check if we're running from an EXE (PyInstaller)
         is_exe = getattr(sys, 'frozen', False)
@@ -104,22 +206,23 @@ def install_browsers() -> tuple[bool, Optional[str]]:
         logging.debug(f"sys.executable: {sys.executable}")
         
         if is_exe:
-            # In EXE mode, try to use bundled Playwright's internal API first
-            # This installs browsers to the location the EXE expects
-            logging.debug("Attempting EXE mode installation...")
+            # In EXE mode, prioritize bundled Playwright's internal API
+            # This installs browsers to the location the bundled Playwright expects
+            logging.debug("Attempting EXE mode installation (prioritizing bundled Playwright)...")
             
-            # First, try using Playwright's internal API (bundled in EXE)
-            logging.debug("Trying Playwright internal API first...")
+            # First, try using Playwright's bundled CLI (most reliable for EXE)
+            logging.debug("Trying bundled Playwright CLI installation (priority method)...")
             try:
+                # Import Playwright modules (after setting path)
                 import playwright
                 from playwright._impl._driver import install_driver
                 
                 # Install the driver first
                 try:
                     driver_path = install_driver()
-                    logging.debug(f"Playwright driver installed at: {driver_path}")
+                    logging.debug(f"Playwright driver installed/verified at: {driver_path}")
                 except Exception as e:
-                    logging.debug(f"Driver already installed or error: {e}")
+                    logging.debug(f"Driver installation check: {e}")
                 
                 # Try to use Playwright's CLI to install browsers
                 try:
@@ -132,32 +235,44 @@ def install_browsers() -> tuple[bool, Optional[str]]:
                         cli_install()
                         logging.debug("Playwright browsers installed via bundled CLI")
                         
-                        # Verify installation
+                        # After installation, find where browsers were installed and set path
                         import time
-                        time.sleep(1)
+                        time.sleep(2)  # Give installation time to complete
+                        browser_path = _find_and_set_installed_browser_path()
+                        if browser_path:
+                            logging.debug(f"Found and set browser path after installation: {browser_path}")
+                        else:
+                            logging.warning("Could not automatically detect browser path after installation")
+                        
+                        # Verify installation
                         if check_browsers_installed():
-                            logging.debug("Installation verified - browsers detected")
+                            logging.debug("Installation verified - browsers detected and working")
                             return True, None
                         else:
-                            logging.warning("Installation completed but browsers not immediately detected")
-                            return True, None  # Still return success, may need restart
+                            logging.warning("Installation completed but browsers not immediately detected - may need restart")
+                            # Still return success - browsers are installed, just need to set path on restart
+                            return True, None
                     finally:
                         sys_module.argv = original_argv
                 except ImportError as cli_import_err:
-                    logging.debug(f"CLI module not available: {cli_import_err}")
+                    logging.debug(f"CLI module not available: {cli_import_err}, trying alternative methods...")
                     # Fall through to launch method
                 except Exception as cli_err:
-                    logging.warning(f"CLI install failed: {cli_err}, trying alternative...")
+                    logging.warning(f"CLI install failed: {cli_err}, trying alternative...", exc_info=True)
                     # Fall through to launch method
                 
                 # Alternative: Try launching browser which triggers installation
-                logging.debug("Trying browser launch method...")
+                logging.debug("Trying browser launch method (may trigger auto-installation)...")
                 from playwright.sync_api import sync_playwright
                 with sync_playwright() as p:
                     try:
                         browser = p.chromium.launch(headless=True)
                         browser.close()
                         logging.debug("Playwright browsers installed successfully (via launch)")
+                        # Find and set browser path after launch-triggered installation
+                        browser_path = _find_and_set_installed_browser_path()
+                        if browser_path:
+                            logging.debug(f"Found and set browser path after launch: {browser_path}")
                         return True, None
                     except Exception as launch_err:
                         error_str = str(launch_err)
@@ -209,31 +324,26 @@ def install_browsers() -> tuple[bool, Optional[str]]:
                     
                     if result.returncode == 0:
                         logging.debug("Playwright browsers installed successfully via Python subprocess")
-                        logging.debug(f"Output: {result.stdout}")
+                        logging.debug(f"Installation output: {result.stdout}")
+                        if result.stderr:
+                            logging.debug(f"Installation stderr: {result.stderr}")
                         
-                        # Try to find where system Python installed browsers and set env var
-                        # This helps the EXE find them
-                        try:
-                            from pathlib import Path
-                            # Playwright installs to user's AppData by default
-                            appdata = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA")
-                            if appdata:
-                                playwright_cache = Path(appdata) / "ms-playwright"
-                                if playwright_cache.exists():
-                                    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(playwright_cache)
-                                    logging.debug(f"Set PLAYWRIGHT_BROWSERS_PATH to: {playwright_cache}")
-                        except Exception as env_err:
-                            logging.debug(f"Could not set environment variable: {env_err}")
+                        # After installation, find where browsers were installed and set path
+                        import time
+                        time.sleep(2)  # Give installation time to complete
+                        browser_path = _find_and_set_installed_browser_path()
+                        if browser_path:
+                            logging.debug(f"Found and set browser path after system Python installation: {browser_path}")
+                        else:
+                            logging.warning("Could not automatically detect browser path after system Python installation")
                         
                         # Re-check to verify installation
-                        import time
-                        time.sleep(2)  # Give it more time to finish
                         if check_browsers_installed():
-                            logging.debug("Installation verified - browsers are now detected")
+                            logging.debug("Installation verified - browsers are now detected and working")
                             return True, None
                         else:
-                            logging.warning("Installation reported success but browsers not detected yet")
-                            # Still return True - may need restart or env var
+                            logging.warning("Installation reported success but browsers not immediately detected - may need restart")
+                            # Still return True - browsers are installed, just need to set path on restart
                             return True, None
                     else:
                         error_msg = result.stderr or result.stdout or "Unknown error"
