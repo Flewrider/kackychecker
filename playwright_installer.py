@@ -88,6 +88,88 @@ if _is_exe:
         pass
 
 
+def _create_browser_version_symlink(expected_version: str) -> bool:
+    """
+    Create a symlink/junction from an installed Chromium version to the expected version.
+    This is needed when system Python installs a different version than what the bundled Playwright expects.
+    
+    Args:
+        expected_version: The Chromium version that the bundled Playwright expects (e.g., "1134")
+    
+    Returns:
+        True if symlink was created or already exists, False otherwise
+    """
+    from pathlib import Path
+    import time
+    
+    # Find the ms-playwright directory
+    appdata = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA")
+    if not appdata:
+        logging.debug("Could not find AppData directory for symlink creation")
+        return False
+    
+    ms_playwright_path = Path(appdata) / "ms-playwright"
+    if not ms_playwright_path.exists():
+        logging.debug(f"ms-playwright directory does not exist: {ms_playwright_path}")
+        return False
+    
+    expected_dir = ms_playwright_path / f"chromium-{expected_version}"
+    if expected_dir.exists():
+        # Check if it's already the right version or a valid symlink
+        if expected_dir.is_symlink() or (expected_dir / "chrome-win" / "chrome.exe").exists():
+            logging.debug(f"Expected version directory already exists: {expected_dir}")
+            return True
+    
+    # Wait a bit for installation to complete
+    time.sleep(2)
+    
+    # Find any installed Chromium version
+    chromium_dirs = [d for d in ms_playwright_path.iterdir() 
+                     if d.is_dir() and d.name.startswith("chromium-") and d.name != f"chromium-{expected_version}"]
+    
+    if not chromium_dirs:
+        logging.debug("No Chromium installation found to create symlink from")
+        return False
+    
+    # Use the first (most recent) installed version
+    installed_dir = chromium_dirs[0]
+    logging.debug(f"Found installed Chromium at: {installed_dir.name}, creating symlink to chromium-{expected_version}")
+    
+    try:
+        # On Windows, create a directory junction (symlink)
+        # Use mklink command via subprocess (junctions work without admin privileges)
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(expected_dir), str(installed_dir)],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        
+        if result.returncode == 0:
+            logging.debug(f"Created junction: {expected_dir} -> {installed_dir}")
+            return True
+        elif "already exists" in result.stdout or "already exists" in result.stderr:
+            logging.debug(f"Junction already exists: {expected_dir}")
+            return True
+        else:
+            logging.warning(f"Failed to create junction via mklink: {result.stderr or result.stdout}")
+            # Try alternative: copy the directory structure (as fallback)
+            # This is less ideal but works without admin privileges
+            logging.debug("Attempting to copy browser files as fallback...")
+            try:
+                import shutil
+                if installed_dir.exists() and not expected_dir.exists():
+                    shutil.copytree(installed_dir, expected_dir, dirs_exist_ok=True)
+                    logging.debug(f"Copied browser directory: {installed_dir.name} -> chromium-{expected_version}")
+                    return True
+            except Exception as copy_err:
+                logging.warning(f"Failed to copy browser directory: {copy_err}")
+            return False
+    except Exception as e:
+        logging.debug(f"Error creating symlink/junction: {e}", exc_info=True)
+        return False
+
+
 def _find_and_set_installed_browser_path() -> Optional[str]:
     """
     Find where Playwright browsers are actually installed and set PLAYWRIGHT_BROWSERS_PATH.
@@ -262,8 +344,23 @@ def install_browsers() -> tuple[bool, Optional[str]]:
             except ImportError:
                 logging.debug("Bundled Playwright CLI not available, using system Python...")
             
-            # If bundled CLI failed or is not available, use system Python
+            # If bundled CLI failed or is not available, detect expected version and install it
             if not bundled_cli_success:
+                # First, check what version the bundled Playwright expects
+                expected_version = None
+                try:
+                    from playwright.sync_api import sync_playwright
+                    with sync_playwright() as p:
+                        browser_path = p.chromium.executable_path
+                        if browser_path:
+                            import re
+                            version_match = re.search(r'chromium-(\d+)', browser_path)
+                            if version_match:
+                                expected_version = version_match.group(1)
+                                logging.debug(f"Bundled Playwright expects chromium-{expected_version}")
+                except Exception as e:
+                    logging.debug(f"Could not determine expected version: {e}")
+                
                 # Find system Python
                 import shutil
                 python_exe = None
@@ -302,6 +399,18 @@ def install_browsers() -> tuple[bool, Optional[str]]:
                     logging.debug(f"Installation stdout: {result.stdout[:500]}")
                     if result.stderr:
                         logging.debug(f"Installation stderr: {result.stderr[:500]}")
+                    
+                    # If we know the expected version and it's different from what was installed,
+                    # create a symlink/junction to make the installed version available as the expected version
+                    if expected_version:
+                        import time
+                        time.sleep(3)  # Wait for installation to complete
+                        symlink_created = _create_browser_version_symlink(expected_version)
+                        if symlink_created:
+                            logging.debug(f"Successfully created symlink/junction for chromium-{expected_version}")
+                        else:
+                            logging.warning(f"Failed to create symlink for chromium-{expected_version} - browser may not work correctly")
+                        
                 except subprocess.TimeoutExpired:
                     return False, "Installation timed out after 10 minutes. Please try installing manually: python -m playwright install chromium"
                 except Exception as e:
@@ -337,6 +446,33 @@ def install_browsers() -> tuple[bool, Optional[str]]:
             
             # Force a fresh path check before verifying
             _ensure_browsers_path_set()
+            
+            # Check if we need to create a symlink for version mismatch
+            # This handles the case where expected_version wasn't detected before installation
+            # OR if we need to create a symlink after installation completes
+            if not bundled_cli_success:
+                try:
+                    from playwright.sync_api import sync_playwright
+                    with sync_playwright() as p:
+                        browser_path_check = p.chromium.executable_path
+                        if browser_path_check:
+                            import re
+                            version_match = re.search(r'chromium-(\d+)', browser_path_check)
+                            if version_match:
+                                detected_expected_version = version_match.group(1)
+                                # Always create symlink if we detect an expected version
+                                # (either we didn't detect it before, or we need to ensure it exists)
+                                if not expected_version or detected_expected_version != expected_version:
+                                    expected_version = detected_expected_version
+                                    logging.debug(f"Detected expected version after installation: chromium-{expected_version}")
+                                    # Create symlink if needed (this will check if it already exists)
+                                    symlink_created = _create_browser_version_symlink(expected_version)
+                                    if symlink_created:
+                                        logging.debug(f"Created/verified symlink for chromium-{expected_version} after installation")
+                                    else:
+                                        logging.warning(f"Failed to create symlink for chromium-{expected_version}")
+                except Exception as e:
+                    logging.debug(f"Could not check expected version after installation: {e}", exc_info=True)
             
             # Verify installation
             if check_browsers_installed():

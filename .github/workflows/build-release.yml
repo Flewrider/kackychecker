@@ -20,7 +20,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.11'
+        python-version: '3.11'  # Note: Browser version mismatch is handled via symlink/junction in playwright_installer.py
     
     - name: Install dependencies
       run: |
