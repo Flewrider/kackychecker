@@ -35,6 +35,19 @@ class WatcherState:
         self.upcoming_by_map: Dict[int, List[Tuple[str, int]]] = {}
         # Remember which watched maps are currently live to avoid repeat notifications
         self.notified_live: Set[int] = set()
+        
+        # Server uptime tracking (in seconds, always full minutes)
+        # Initialize with known defaults:
+        # Servers 1-4: 10 minutes (600 seconds)
+        # Servers 5-8: 13 minutes (780 seconds)
+        # Servers 9-10: 15 minutes (900 seconds)
+        self.server_uptime_seconds: Dict[str, int] = {}
+        for server_num in range(1, 5):
+            self.server_uptime_seconds[f"Server {server_num}"] = 600  # 10 minutes
+        for server_num in range(5, 9):
+            self.server_uptime_seconds[f"Server {server_num}"] = 780  # 13 minutes
+        for server_num in range(9, 11):
+            self.server_uptime_seconds[f"Server {server_num}"] = 900  # 15 minutes
     
     def update_from_fetch(self, rows: List[Dict[str, str]], watched: Set[int]) -> Set[int]:
         """
@@ -69,9 +82,23 @@ class WatcherState:
                 needs_retry = r.get("needs_retry", False)
                 
                 # Skip maps with empty time cells (transitioning) - handle locally
-                if needs_retry and remaining_time_str == "600":
-                    logging.debug("Map #%s has empty time cell (transitioning), skipping time update", mn)
+                # When needs_retry is True, the parser used server_uptime as a placeholder
+                # We shouldn't update state with placeholder data, but we can learn from real data
+                if needs_retry:
+                    # The parser set remaining_time to server_uptime as a placeholder
+                    # Don't update state with this placeholder - handle locally using server uptime
+                    logging.debug("Map #%s has empty time cell (transitioning), skipping time update (will use server uptime locally)", mn)
+                    # Still add to live_now for reference, but don't update live_until_by_map
+                    live_now.add(mn)
                     continue
+                
+                # Update server uptime knowledge from observed data (only if we have real data)
+                if remaining_time_str and remaining_time_str.isdigit():
+                    remaining_seconds = int(remaining_time_str)
+                    # Learn server uptime from observed remaining time
+                    # Maps that just went live have close to full uptime
+                    if remaining_seconds > 0:
+                        self.update_server_uptime(srv, remaining_seconds)
                 
                 # Update live time if map is already live locally
                 if mn in self.live_until_by_map:
@@ -89,8 +116,10 @@ class WatcherState:
                         self.live_until_by_map[mn] = now_ts + remaining_seconds
                         logging.debug("Map #%s added to live state (new map): remaining %ds", mn, remaining_seconds)
                     else:
-                        self.live_until_by_map[mn] = now_ts + self.live_duration_seconds
-                        logging.debug("Map #%s added to live state (new map): default duration", mn)
+                        # Use server's uptime instead of default duration
+                        server_uptime = self.get_server_uptime(srv)
+                        self.live_until_by_map[mn] = now_ts + server_uptime
+                        logging.debug("Map #%s added to live state (new map): server uptime %ds", mn, server_uptime)
                     if srv:
                         self.live_servers_by_map.setdefault(mn, set()).add(srv)
                 # If map is in tracked (has ETA), don't change state - it will transition locally when ETA hits 0
@@ -356,4 +385,59 @@ class WatcherState:
         if not candidates:
             return None
         return min(candidates)
+    
+    def update_server_uptime(self, server: str, observed_remaining_time: int) -> None:
+        """
+        Update server uptime based on observed remaining time.
+        Uptimes are always full minutes (10, 12, 15, etc.), so we learn from maps that
+        just went live (which have close to full uptime remaining).
+        
+        Args:
+            server: Server label (e.g., "Server 1")
+            observed_remaining_time: Observed remaining time in seconds
+        """
+        if not server or observed_remaining_time <= 0:
+            return
+        
+        # Convert to minutes (rounding to nearest)
+        observed_minutes_float = observed_remaining_time / 60.0
+        observed_minutes = round(observed_minutes_float)
+        observed_seconds = observed_minutes * 60
+        
+        current_uptime = self.server_uptime_seconds.get(server, 600)
+        current_minutes = current_uptime // 60
+        
+        # Only update if:
+        # 1. Observed time is within 30 seconds of a full minute (maps start with ~full uptime)
+        # 2. The rounded minutes value is close to or higher than current uptime
+        # 3. Observed time is at least 95% of current uptime (to avoid updates from mid-cycle observations)
+        
+        time_diff_from_full_minute = abs(observed_seconds - observed_remaining_time)
+        
+        # Check if observed time is close to a full minute (within 30 seconds)
+        is_close_to_full_minute = time_diff_from_full_minute <= 30
+        
+        # Check if this looks like a map that just went live (high remaining time)
+        is_high_remaining_time = observed_remaining_time >= current_uptime * 0.95
+        
+        if is_close_to_full_minute and (observed_seconds >= current_uptime or is_high_remaining_time):
+            # Only update if the new value is higher, or if it's very close to current (within 1 minute)
+            if observed_seconds > current_uptime or (observed_seconds >= current_uptime * 0.95 and observed_seconds <= current_uptime * 1.05):
+                self.server_uptime_seconds[server] = observed_seconds
+                logging.debug("Updated server %s uptime to %d seconds (%d minutes) (observed %d seconds, %.1f minutes)", 
+                             server, observed_seconds, observed_minutes, observed_remaining_time, observed_minutes_float)
+    
+    def get_server_uptime(self, server: str) -> int:
+        """
+        Get uptime for a server, falling back to default if unknown.
+        
+        Args:
+            server: Server label (e.g., "Server 1")
+            
+        Returns:
+            Uptime in seconds (always a full minute)
+        """
+        if not server:
+            return 600  # Default fallback
+        return self.server_uptime_seconds.get(server, 600)
 

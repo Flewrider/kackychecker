@@ -235,7 +235,7 @@ class KackyWatcher:
             logging.debug("[browser] Fetched %d chars of HTML", len(html))
             if len(html) < 100:
                 logging.warning("[browser] HTML content seems very short: %d chars", len(html))
-            rows = parse_live_maps(html)
+            rows = parse_live_maps(html, server_uptimes=self.state.server_uptime_seconds)
             logging.debug("[browser] Parsed %d schedule rows", len(rows))
         except Exception as e:
             logging.error("Browser fetch failed: %s", e, exc_info=True)
@@ -244,7 +244,7 @@ class KackyWatcher:
             try:
                 html = fetch_schedule_html(self.config["USER_AGENT"], self.config["REQUEST_TIMEOUT_SECONDS"])
                 logging.debug("Fetched %d chars of HTML (fallback)", len(html))
-                rows = parse_live_maps(html)
+                rows = parse_live_maps(html, server_uptimes=self.state.server_uptime_seconds)
                 logging.debug("Parsed %d schedule rows (fallback)", len(rows))
             except Exception as e2:
                 logging.error("HTTP fallback also failed: %s", e2, exc_info=True)
@@ -398,13 +398,13 @@ class KackyWatcher:
             # Automatically mark expired ETAs as live locally (no fetch needed)
             for mn in expired_etas:
                 if mn not in self.state.live_until_by_map or self.state.live_until_by_map[mn] <= now_ts:
-                    # Mark as live with default duration
-                    self.state.live_until_by_map[mn] = now_ts + self.state.live_duration_seconds
+                    # Mark as live with server's uptime duration
+                    server = self.state.server_by_map.get(mn, "")
+                    server_uptime = self.state.get_server_uptime(server)
+                    self.state.live_until_by_map[mn] = now_ts + server_uptime
                     # Schedule resync fetch 1 minute after going live
                     self.live_map_resync_times[mn] = now_ts + 60.0
-                    logging.debug("Map #%s ETA expired locally, marked as live (resync in 60s)", mn)
-                    # Get server from state if available
-                    server = self.state.server_by_map.get(mn, "")
+                    logging.debug("Map #%s ETA expired locally, marked as live (server uptime %ds, resync in 60s)", mn, server_uptime)
                     if server:
                         self.state.live_servers_by_map.setdefault(mn, set()).add(server)
                     # Remove from ETA tracking since it's now live
