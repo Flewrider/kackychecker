@@ -16,6 +16,9 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch full history for git describe to work properly
+        fetch-tags: true  # Fetch all tags so git describe can find them
     
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -54,10 +57,56 @@ jobs:
     - name: Get version from git
       id: version
       run: |
-        $version = git describe --tags --always
-        if ($LASTEXITCODE -ne 0) {
-          $version = "v1.0.0-$(git rev-parse --short HEAD)"
+        # Try to get exact tag for current commit first
+        $exactTag = git describe --tags --exact-match HEAD 2>$null
+        if ($LASTEXITCODE -eq 0 -and $exactTag) {
+          $version = $exactTag
+          echo "Found exact tag for current commit: $version"
+        } else {
+          # No exact tag found - try to get the latest release tag and increment
+          # Use git to sort tags by version (git tag --sort=-version:refname sorts descending)
+          $allTagsOutput = git tag -l "v*" --sort=-version:refname 2>$null
+          if ($LASTEXITCODE -eq 0 -and $allTagsOutput) {
+            # Get the first line (latest tag) from the output
+            $latestTag = ($allTagsOutput -split "`n" | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' } | Select-Object -First 1).Trim()
+            if ($latestTag) {
+              echo "Latest release tag: $latestTag"
+              
+              # Extract version numbers (e.g., v1.0.2 -> 1, 0, 2)
+              if ($latestTag -match '^v(\d+)\.(\d+)\.(\d+)$') {
+                $major = [int]$matches[1]
+                $minor = [int]$matches[2]
+                $patch = [int]$matches[3]
+                
+                # Increment patch version
+                $newPatch = $patch + 1
+                $version = "v$major.$minor.$newPatch"
+                echo "Auto-incremented version: $latestTag -> $version"
+              } else {
+                # Latest tag doesn't match expected format, use commit hash
+                $commitHash = git rev-parse --short HEAD
+                $version = "v1.0.0-$commitHash"
+                echo "Latest tag doesn't match version format, using commit hash: $version"
+              }
+            } else {
+              # No valid version tags found, use commit hash
+              $commitHash = git rev-parse --short HEAD
+              $version = "v1.0.0-$commitHash"
+              echo "No valid version tags found, using commit hash: $version"
+            }
+          } else {
+            # No tags found at all, use commit hash
+            $commitHash = git rev-parse --short HEAD
+            $version = "v1.0.0-$commitHash"
+            echo "No release tags found, using commit hash: $version"
+          }
         }
+        
+        if (-not $version) {
+          Write-Error "Failed to determine version - aborting build"
+          exit 1
+        }
+        
         echo "version=$version" >> $env:GITHUB_OUTPUT
         echo "Created version: $version"
     
