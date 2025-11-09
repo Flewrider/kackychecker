@@ -16,7 +16,7 @@ A Windows desktop application that monitors the [Kacky schedule](https://kacky.g
 ### Pre-built EXE (Recommended)
 
 1. **Download from GitHub Releases**
-   - Go to [Releases](https://github.com/yourusername/kackychecker/releases)
+   - Go to [Releases](https://github.com/flewrider/kackychecker/releases)
    - Download the latest `KackyWatcher.zip`
    - Extract the zip file
    - Run `KackyWatcher.exe`
@@ -108,7 +108,7 @@ The application uses a smart polling system that minimizes website requests:
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/yourusername/kackychecker.git
+   git clone https://github.com/flewrider/kackychecker.git
    cd kackychecker
    ```
 

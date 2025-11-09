@@ -41,4 +41,5 @@ watchlist.txt
 build/
 dist/
 *.spec
+!kacky_watcher.spec
 *.pyc
