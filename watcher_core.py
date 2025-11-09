@@ -224,43 +224,30 @@ class KackyWatcher:
         rows: List[Dict[str, str]] = []
         
         logging.debug("Starting schedule fetch...")
-        logging.debug("ENABLE_BROWSER setting: %s", self.config.get("ENABLE_BROWSER", True))
-        
-        # Try browser first since HTTP requests don't work for this site
+        # Always use browser (Playwright) since HTTP requests don't work for this site
         # (site requires JavaScript rendering)
-        if self.config.get("ENABLE_BROWSER", True):
-            logging.debug("Attempting browser fetch (Playwright)...")
-            try:
-                html = fetch_schedule_html_browser(
-                    timeout=self.config["REQUEST_TIMEOUT_SECONDS"] * 2,
-                    user_agent=self.config["USER_AGENT"]
-                )
-                logging.debug("[browser] Fetched %d chars of HTML", len(html))
-                if len(html) < 100:
-                    logging.warning("[browser] HTML content seems very short: %d chars", len(html))
-                rows = parse_live_maps(html)
-                logging.debug("[browser] Parsed %d schedule rows", len(rows))
-            except Exception as e:
-                logging.error("Browser fetch failed: %s", e, exc_info=True)
-                # Fall back to HTTP if browser fails
-                logging.debug("Falling back to HTTP fetch...")
-                try:
-                    html = fetch_schedule_html(self.config["USER_AGENT"], self.config["REQUEST_TIMEOUT_SECONDS"])
-                    logging.debug("Fetched %d chars of HTML (fallback)", len(html))
-                    rows = parse_live_maps(html)
-                    logging.debug("Parsed %d schedule rows (fallback)", len(rows))
-                except Exception as e2:
-                    logging.error("HTTP fallback also failed: %s", e2, exc_info=True)
-        else:
-            # Browser disabled, try HTTP only
-            logging.debug("Browser disabled, using HTTP fetch only...")
+        logging.debug("Attempting browser fetch (Playwright)...")
+        try:
+            html = fetch_schedule_html_browser(
+                timeout=self.config["REQUEST_TIMEOUT_SECONDS"] * 2,
+                user_agent=self.config["USER_AGENT"]
+            )
+            logging.debug("[browser] Fetched %d chars of HTML", len(html))
+            if len(html) < 100:
+                logging.warning("[browser] HTML content seems very short: %d chars", len(html))
+            rows = parse_live_maps(html)
+            logging.debug("[browser] Parsed %d schedule rows", len(rows))
+        except Exception as e:
+            logging.error("Browser fetch failed: %s", e, exc_info=True)
+            # Fall back to HTTP if browser fails (usually won't work, but try anyway)
+            logging.debug("Falling back to HTTP fetch...")
             try:
                 html = fetch_schedule_html(self.config["USER_AGENT"], self.config["REQUEST_TIMEOUT_SECONDS"])
-                logging.debug("Fetched %d chars of HTML", len(html))
+                logging.debug("Fetched %d chars of HTML (fallback)", len(html))
                 rows = parse_live_maps(html)
-                logging.debug("Parsed %d schedule rows", len(rows))
-            except Exception as e:
-                logging.error("HTTP fetch failed: %s", e, exc_info=True)
+                logging.debug("Parsed %d schedule rows (fallback)", len(rows))
+            except Exception as e2:
+                logging.error("HTTP fallback also failed: %s", e2, exc_info=True)
         
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             for i, r in enumerate(rows[:50]):  # cap to avoid flooding

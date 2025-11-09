@@ -16,46 +16,68 @@ SETTINGS_FILE = "settings.json"  # For backward compatibility, actual path comes
 def get_default_settings() -> Dict[str, Any]:
     """Get default settings dictionary."""
     return {
-        "CHECK_INTERVAL_SECONDS": 20,
+        # User-facing settings
+        "LOG_LEVEL": "INFO",
+        "ENABLE_NOTIFICATIONS": True,  # Windows toast notifications
+        # Internal settings (not shown in GUI)
         "REQUEST_TIMEOUT_SECONDS": 10,
         "USER_AGENT": "KackyWatcher/1.0 (+https://kacky.gg/schedule)",
-        "LOG_LEVEL": "INFO",
-        "ENABLE_BROWSER": True,
         "WATCHLIST_REFRESH_SECONDS": 20,
-        "ETA_MARGIN_SECONDS": 2,
-        "ETA_FETCH_THRESHOLD_SECONDS": 60,
-        "LIVE_DURATION_SECONDS": 600,
-        "ENABLE_NOTIFICATIONS": True,  # Windows toast notifications
+        "LIVE_DURATION_SECONDS": 600,  # Fallback duration when time not available from website
     }
 
 
 def load_settings() -> Dict[str, Any]:
     """
     Load settings from JSON file, or return defaults if file doesn't exist.
+    Removes deprecated settings and ensures only current settings are loaded.
     
     Returns:
         Dictionary containing all settings with appropriate types.
     """
     settings_path = get_settings_file()
+    defaults = get_default_settings()
+    
     if not os.path.exists(settings_path):
-        return get_default_settings()
+        return defaults
     
     try:
         with open(settings_path, "r", encoding="utf-8") as f:
             loaded = json.load(f)
         
-        # Merge with defaults to ensure all keys exist
-        defaults = get_default_settings()
-        defaults.update(loaded)
-        return defaults
+        # List of deprecated settings to remove
+        deprecated_settings = [
+            "CHECK_INTERVAL_SECONDS",
+            "ENABLE_BROWSER",  # Always use browser now
+            "ETA_MARGIN_SECONDS",  # Not used anymore
+            "ETA_FETCH_THRESHOLD_SECONDS",  # Not used anymore
+        ]
+        
+        # Remove deprecated settings
+        for key in deprecated_settings:
+            if key in loaded:
+                del loaded[key]
+                logging.debug(f"Removed deprecated setting: {key}")
+        
+        # Merge with defaults to ensure all keys exist and add any missing defaults
+        result = defaults.copy()
+        result.update(loaded)
+        
+        # Ensure internal settings are preserved (they might not be in old settings files)
+        for key in ["USER_AGENT", "REQUEST_TIMEOUT_SECONDS", "WATCHLIST_REFRESH_SECONDS", "LIVE_DURATION_SECONDS"]:
+            if key not in result:
+                result[key] = defaults[key]
+        
+        return result
     except (json.JSONDecodeError, IOError) as e:
         logging.warning(f"Error loading settings file: {e}. Using defaults.")
-        return get_default_settings()
+        return defaults
 
 
 def save_settings(settings: Dict[str, Any]) -> bool:
     """
     Save settings to JSON file.
+    Removes deprecated settings before saving.
     
     Args:
         settings: Settings dictionary to save
@@ -64,9 +86,21 @@ def save_settings(settings: Dict[str, Any]) -> bool:
         True if successful, False otherwise
     """
     try:
+        # Remove deprecated settings before saving
+        deprecated_settings = [
+            "CHECK_INTERVAL_SECONDS",
+            "ENABLE_BROWSER",  # Always use browser now
+            "ETA_MARGIN_SECONDS",  # Not used anymore
+            "ETA_FETCH_THRESHOLD_SECONDS",  # Not used anymore
+        ]
+        
+        cleaned_settings = settings.copy()
+        for key in deprecated_settings:
+            cleaned_settings.pop(key, None)
+        
         settings_path = get_settings_file()
         with open(settings_path, "w", encoding="utf-8") as f:
-            json.dump(settings, f, indent=2, ensure_ascii=False)
+            json.dump(cleaned_settings, f, indent=2, ensure_ascii=False)
         return True
     except IOError as e:
         logging.error(f"Error saving settings file: {e}")

@@ -1092,7 +1092,7 @@ class KackyWatcherGUI:
         settings = load_settings()
         dialog = tk.Toplevel(self.root)
         dialog.title("Settings")
-        dialog.geometry("500x600")
+        dialog.geometry("500x300")  # Smaller dialog since we have fewer settings
         dialog.transient(self.root)
         dialog.grab_set()
         
@@ -1118,21 +1118,10 @@ class KackyWatcherGUI:
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
         
-        # Settings fields
+        # Settings fields (only user-facing settings)
         row = 0
-        ttk.Label(scrollable_frame, text="Log Level:", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
-        log_level_var = tk.StringVar(value=settings.get("LOG_LEVEL", "INFO"))
-        log_level_combo = ttk.Combobox(scrollable_frame, textvariable=log_level_var, values=["DEBUG", "INFO", "WARNING", "ERROR"], state="readonly", width=20)
-        log_level_combo.grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
-        vars_frame["LOG_LEVEL"] = log_level_var
-        row += 1
         
-        ttk.Label(scrollable_frame, text="Enable Browser Fallback:", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
-        enable_browser_var = tk.BooleanVar(value=settings.get("ENABLE_BROWSER", True))
-        ttk.Checkbutton(scrollable_frame, variable=enable_browser_var).grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
-        vars_frame["ENABLE_BROWSER"] = enable_browser_var
-        row += 1
-        
+        # Enable Notifications
         ttk.Label(scrollable_frame, text="Enable Notifications:", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
         enable_notif_var = tk.BooleanVar(value=settings.get("ENABLE_NOTIFICATIONS", True))
         notif_cb = ttk.Checkbutton(scrollable_frame, variable=enable_notif_var)
@@ -1143,34 +1132,13 @@ class KackyWatcherGUI:
         vars_frame["ENABLE_NOTIFICATIONS"] = enable_notif_var
         row += 1
         
-        ttk.Label(scrollable_frame, text="Request Timeout (seconds):", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
-        timeout_var = tk.IntVar(value=settings.get("REQUEST_TIMEOUT_SECONDS", 10))
-        ttk.Spinbox(scrollable_frame, from_=1, to=60, textvariable=timeout_var, width=20).grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
-        vars_frame["REQUEST_TIMEOUT_SECONDS"] = timeout_var
-        row += 1
-        
-        ttk.Label(scrollable_frame, text="ETA Fetch Threshold (seconds):", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
-        eta_threshold_var = tk.IntVar(value=settings.get("ETA_FETCH_THRESHOLD_SECONDS", 60))
-        ttk.Spinbox(scrollable_frame, from_=10, to=300, textvariable=eta_threshold_var, width=20).grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
-        vars_frame["ETA_FETCH_THRESHOLD_SECONDS"] = eta_threshold_var
-        row += 1
-        
-        ttk.Label(scrollable_frame, text="Live Duration (seconds):", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
-        live_duration_var = tk.IntVar(value=settings.get("LIVE_DURATION_SECONDS", 600))
-        ttk.Spinbox(scrollable_frame, from_=60, to=3600, textvariable=live_duration_var, width=20).grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
-        vars_frame["LIVE_DURATION_SECONDS"] = live_duration_var
-        row += 1
-        
-        ttk.Label(scrollable_frame, text="Watchlist Refresh (seconds):", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
-        watchlist_refresh_var = tk.IntVar(value=settings.get("WATCHLIST_REFRESH_SECONDS", 20))
-        ttk.Spinbox(scrollable_frame, from_=5, to=120, textvariable=watchlist_refresh_var, width=20).grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
-        vars_frame["WATCHLIST_REFRESH_SECONDS"] = watchlist_refresh_var
-        row += 1
-        
-        ttk.Label(scrollable_frame, text="ETA Margin (seconds):", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
-        eta_margin_var = tk.IntVar(value=settings.get("ETA_MARGIN_SECONDS", 2))
-        ttk.Spinbox(scrollable_frame, from_=0, to=10, textvariable=eta_margin_var, width=20).grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
-        vars_frame["ETA_MARGIN_SECONDS"] = eta_margin_var
+        # Log Level (for debugging)
+        ttk.Label(scrollable_frame, text="Log Level:", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
+        log_level_var = tk.StringVar(value=settings.get("LOG_LEVEL", "INFO"))
+        log_level_combo = ttk.Combobox(scrollable_frame, textvariable=log_level_var, values=["DEBUG", "INFO", "WARNING", "ERROR"], state="readonly", width=20)
+        log_level_combo.grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
+        ttk.Label(scrollable_frame, text="(for troubleshooting)", font=("Arial", 8), foreground="gray").grid(row=row, column=2, sticky=tk.W, padx=5)
+        vars_frame["LOG_LEVEL"] = log_level_var
         row += 1
         
         # Buttons
@@ -1188,8 +1156,11 @@ class KackyWatcherGUI:
                 elif isinstance(var, tk.StringVar):
                     new_settings[key] = var.get()
             
-            # Preserve USER_AGENT
-            new_settings["USER_AGENT"] = settings.get("USER_AGENT", get_default_settings()["USER_AGENT"])
+            # Preserve internal settings that are not shown in GUI
+            defaults = get_default_settings()
+            for key in ["USER_AGENT", "REQUEST_TIMEOUT_SECONDS", "WATCHLIST_REFRESH_SECONDS", "LIVE_DURATION_SECONDS"]:
+                if key in defaults:
+                    new_settings[key] = settings.get(key, defaults[key])
             
             if save_settings(new_settings):
                 # Reload config
