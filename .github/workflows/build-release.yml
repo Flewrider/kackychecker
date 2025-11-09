@@ -54,7 +54,8 @@ jobs:
         path: dist/KackyWatcher/  # Upload directory directly - GitHub Actions will zip it automatically
         retention-days: 7  # Keep artifact for 7 days
     
-    - name: Get version from git
+    - name: Get version from git (main branch only)
+      if: github.ref == 'refs/heads/main'
       id: version
       run: |
         # Try to get exact tag for current commit first
