@@ -1,11 +1,8 @@
 {
-  "LOG_LEVEL": "INFO",
-  "ENABLE_BROWSER": true,
   "ENABLE_NOTIFICATIONS": true,
+  "LOG_LEVEL": "INFO",
+  "USER_AGENT": "KackyWatcher/1.0 (+https://kacky.gg/schedule)",
   "REQUEST_TIMEOUT_SECONDS": 10,
-  "ETA_FETCH_THRESHOLD_SECONDS": 60,
-  "LIVE_DURATION_SECONDS": 600,
   "WATCHLIST_REFRESH_SECONDS": 20,
-  "ETA_MARGIN_SECONDS": 2,
-  "USER_AGENT": "KackyWatcher/1.0 (+https://kacky.gg/schedule)"
+  "LIVE_DURATION_SECONDS": 600
 }

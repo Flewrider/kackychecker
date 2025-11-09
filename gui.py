@@ -20,11 +20,11 @@ from playwright_installer import check_browsers_installed, install_browsers_with
 
 # Windows notifications
 try:
-    from win10toast import ToastNotifier
-    HAS_NOTIFICATIONS = True
+    from windows_notifications import HAS_NOTIFICATIONS, show_notification_async
 except ImportError:
     HAS_NOTIFICATIONS = False
-    ToastNotifier = None
+    def show_notification_async(title: str, message: str, duration: int = 5) -> None:
+        pass
 
 
 class KackyWatcherGUI:
@@ -45,8 +45,8 @@ class KackyWatcherGUI:
         self.root.title("Kacky Watcher")
         self.root.geometry("1200x700")
         
-        # Initialize Windows notifications
-        self.toast = ToastNotifier() if HAS_NOTIFICATIONS else None
+        # Windows notifications are handled via windows_notifications module
+        # No instance needed - use show_notification_async() function directly
         
         print("Loading config...")
         self.config = load_config()
@@ -775,52 +775,22 @@ class KackyWatcherGUI:
         notifications_enabled = self.config.get("ENABLE_NOTIFICATIONS", True)
         logging.debug(f"Notifications enabled: {notifications_enabled}, HAS_NOTIFICATIONS: {HAS_NOTIFICATIONS}")
         
-        # Show Windows toast notification if enabled
+        # Show Windows notification if enabled
         if notifications_enabled and HAS_NOTIFICATIONS:
             try:
                 title = f"Map #{map_number} is LIVE!"
                 message = f"Map #{map_number} is now live{server_text}"
                 logging.debug(f"Attempting to show notification: title='{title}', message='{message}'")
-                
-                # Run notification in a separate thread to avoid blocking GUI
-                # Suppress win10toast errors that don't affect functionality
-                def show_notification():
-                    try:
-                        logging.debug("Notification thread started")
-                        import sys
-                        import io
-                        # Temporarily suppress stderr to hide win10toast WPARAM errors
-                        old_stderr = sys.stderr
-                        sys.stderr = io.StringIO()
-                        try:
-                            # Create new instance in thread to avoid GUI thread conflicts
-                            toast = ToastNotifier()
-                            logging.debug("ToastNotifier created, calling show_toast...")
-                            result = toast.show_toast(title, message, duration=5, threaded=False)
-                            logging.debug(f"show_toast returned: {result}")
-                        finally:
-                            sys.stderr = old_stderr
-                            logging.debug("Notification thread completed")
-                    except Exception as e:
-                        # Log all errors for debugging
-                        error_str = str(e)
-                        logging.error(f"Exception in notification thread: {e}", exc_info=True)
-                        # Only suppress known benign errors
-                        if "WPARAM" not in error_str and "classAtom" not in error_str:
-                            logging.warning(f"Failed to show notification: {e}")
-                        else:
-                            logging.debug(f"Suppressed known win10toast error: {e}")
-                
-                notification_thread = threading.Thread(target=show_notification, daemon=True, name="NotificationThread")
-                notification_thread.start()
-                logging.debug(f"Notification thread started: {notification_thread.name}")
+                # Show notification asynchronously (runs in separate thread)
+                show_notification_async(title, message, duration=5)
+                logging.debug("Notification request sent")
             except Exception as e:
-                logging.error(f"Failed to start notification thread: {e}", exc_info=True)
+                logging.error(f"Failed to show notification: {e}", exc_info=True)
         else:
             if not notifications_enabled:
                 logging.debug("Notifications disabled in settings")
             if not HAS_NOTIFICATIONS:
-                logging.debug("win10toast not available (HAS_NOTIFICATIONS=False)")
+                logging.debug("Windows notifications not available (HAS_NOTIFICATIONS=False)")
         
         # Transition refetches removed - maps can appear live on different servers immediately
     
@@ -1139,7 +1109,7 @@ class KackyWatcherGUI:
         notif_cb.grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
         if not HAS_NOTIFICATIONS:
             notif_cb.config(state=tk.DISABLED)
-            ttk.Label(scrollable_frame, text="(win10toast not installed)", font=("Arial", 8), foreground="gray").grid(row=row, column=2, sticky=tk.W, padx=5)
+            ttk.Label(scrollable_frame, text="(Windows notifications not available)", font=("Arial", 8), foreground="gray").grid(row=row, column=2, sticky=tk.W, padx=5)
         vars_frame["ENABLE_NOTIFICATIONS"] = enable_notif_var
         row += 1
         
@@ -1186,11 +1156,8 @@ class KackyWatcherGUI:
                     if hasattr(self.watcher, 'state') and hasattr(self.watcher.state, 'live_duration_seconds'):
                         self.watcher.state.live_duration_seconds = self.config.get("LIVE_DURATION_SECONDS", 600)
                 
-                # Update toast notification availability
-                if self.config.get("ENABLE_NOTIFICATIONS", True) and HAS_NOTIFICATIONS:
-                    self.toast = ToastNotifier() if not self.toast else self.toast
-                else:
-                    self.toast = None
+                # Notifications are handled via windows_notifications module
+                # No instance management needed
                 
                 messagebox.showinfo("Settings", "Settings saved successfully!\nChanges have been applied immediately.")
                 dialog.destroy()
