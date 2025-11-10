@@ -126,9 +126,8 @@ jobs:
         files: dist/KackyWatcher.zip
         tag_name: ${{ steps.version.outputs.version }}
         name: Release ${{ steps.version.outputs.version }}
+        generate_release_notes: true
         body: |
-          Automated build from main branch.
-          
           **Installation:**
           1. Download and extract `KackyWatcher.zip`
           2. **Ensure Python 3.11+ is installed** on your system (required for browser installation)
