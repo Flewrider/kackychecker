@@ -1,12 +1,31 @@
 """
 Watchlist management module for Kacky Watcher.
 Handles loading, saving, and validation of watchlist files.
+
+DEPRECATED: This module is deprecated. Watchlist functionality has been moved to
+map_status.json via map_status_manager. This module is kept for backwards
+compatibility and testing purposes only.
 """
 import os
 import re
+import sys
 from typing import Set
+from pathlib import Path
 
-from path_utils import get_watchlist_file
+
+def _get_watchlist_file() -> str:
+    """
+    Get path to watchlist.txt file (deprecated).
+    
+    This function is defined locally here since get_watchlist_file() was
+    removed from path_utils.py as part of removing watchlist.txt dependencies.
+    """
+    if getattr(sys, 'frozen', False):
+        # Running as compiled EXE (PyInstaller)
+        return os.path.join(os.path.dirname(sys.executable), "watchlist.txt")
+    else:
+        # Running as script
+        return os.path.join(os.getcwd(), "watchlist.txt")
 
 
 def load_watchlist(path: str = None) -> Set[int]:
@@ -20,7 +39,7 @@ def load_watchlist(path: str = None) -> Set[int]:
         Set of map numbers (integers)
     """
     if path is None:
-        path = get_watchlist_file()
+        path = _get_watchlist_file()
     
     watched: Set[int] = set()
     if not os.path.exists(path):
@@ -49,7 +68,7 @@ def save_watchlist(map_numbers: Set[int], path: str = None) -> None:
         path: Path to watchlist file (if None, uses default from path_utils)
     """
     if path is None:
-        path = get_watchlist_file()
+        path = _get_watchlist_file()
     
     with open(path, "w", encoding="utf-8") as f:
         f.write("# One map number per line. Lines starting with # are comments.\n")

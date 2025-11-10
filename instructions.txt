@@ -23,19 +23,15 @@ Windows usage (PowerShell 7)
      - LOG_LEVEL=INFO
      - ENABLE_BROWSER=0   # set to 1 to use the browser fallback
 
-5) Edit your watchlist
-   - Open watchlist.txt and list the map numbers you care about
-   - One number per line, e.g.
-     379
-     385
+5) Run the watcher
+   - python main.py
+   - The GUI will open - check boxes next to map numbers you want to track
+   - Maps are automatically saved to map_status.json
+   - Leave the window open; it will poll and notify when a tracked map goes LIVE
+   - For more detail, set LOG_LEVEL=DEBUG in .env or in the GUI settings
 
-6) Run the watcher
-   - python .\\kacky_watcher.py
-   - Leave the window open; it will poll and print when a watched map goes LIVE
-   - For more detail, set LOG_LEVEL=DEBUG in .env
-
-7) Stop the watcher
-   - Press Ctrl+C
+6) Stop the watcher
+   - Close the GUI window or press Ctrl+C in the terminal
 
 Notes
 - Source page: https://kacky.gg/schedule

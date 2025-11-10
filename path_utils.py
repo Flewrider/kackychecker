@@ -31,11 +31,6 @@ def get_settings_file() -> str:
     return os.path.join(get_data_directory(), "settings.json")
 
 
-def get_watchlist_file() -> str:
-    """Get path to watchlist.txt file."""
-    return os.path.join(get_data_directory(), "watchlist.txt")
-
-
 def get_map_status_file() -> str:
     """Get path to map_status.json file."""
     return os.path.join(get_data_directory(), "map_status.json")

@@ -503,7 +503,7 @@ class KackyWatcherGUI:
     def initialize_default_files(self) -> None:
         """Initialize default files on first run if they don't exist."""
         import os
-        from path_utils import get_settings_file, get_watchlist_file, get_map_status_file
+        from path_utils import get_settings_file, get_map_status_file
         from settings_manager import get_default_settings, save_settings
         
         # Initialize settings.json if it doesn't exist
@@ -512,14 +512,6 @@ class KackyWatcherGUI:
             default_settings = get_default_settings()
             save_settings(default_settings)
             logging.debug("Created default settings.json")
-        
-        # Initialize watchlist.txt if it doesn't exist (empty file with header)
-        watchlist_path = get_watchlist_file()
-        if not os.path.exists(watchlist_path):
-            with open(watchlist_path, "w", encoding="utf-8") as f:
-                f.write("# One map number per line. Lines starting with # are comments.\n")
-                f.write("# Examples:\n")
-            logging.debug("Created default watchlist.txt")
         
         # Initialize map_status.json if it doesn't exist (empty state)
         status_path = get_map_status_file()

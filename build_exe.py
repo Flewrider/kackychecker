@@ -74,7 +74,7 @@ def main():
     print(f"  1. Navigate to: {exe_path.parent.absolute()}")
     print("  2. Run: KackyWatcher.exe")
     print("  3. The app will prompt you to install Playwright browsers (required)")
-    print("  4. Check that settings.json, watchlist.txt, and map_status.json are created in the same directory")
+    print("  4. Check that settings.json and map_status.json are created in the same directory")
 
 
 if __name__ == "__main__":

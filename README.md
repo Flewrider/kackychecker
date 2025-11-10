@@ -32,8 +32,7 @@ THIS HAS BEEN MADE WITH AI.
 
 3. **Configuration Files**
    - `settings.json` - Application settings (created automatically)
-   - `watchlist.txt` - List of maps to track (created automatically)
-   - `map_status.json` - Tracking state (created automatically)
+   - `map_status.json` - Tracking state and watched maps (created automatically)
    - `log.txt` - Application logs (created automatically)
    
    All files are created in the same folder as `KackyWatcher.exe` on first run.
@@ -49,12 +48,12 @@ THIS HAS BEEN MADE WITH AI.
 
 ## Usage
 
-### Adding Maps to Watchlist
+### Adding Maps to Track
 
 1. Launch `KackyWatcher.exe`
 2. In the left pane, check the boxes next to map numbers you want to track
-3. Maps are automatically saved to `watchlist.txt`
-4. Uncheck boxes to remove maps from the watchlist
+3. Maps are automatically saved to `map_status.json`
+4. Uncheck boxes to remove maps from tracking
 
 ### Understanding the Display
 
@@ -89,7 +88,7 @@ The application uses a smart polling system that minimizes website requests:
 2. **Local Countdown**: ETAs and live times count down locally every second
 3. **State Transitions**: Tracked maps automatically become live when ETA hits 0
 4. **Time Syncing**: Fetches only when:
-   - New maps are added to watchlist (no data available)
+   - New maps are added to tracking (no data available)
    - Live maps need resync (1 minute after going live)
    - Periodic refetch (every 60s for unknown time maps, or 5 minutes for staleness prevention)
 5. **Live Persistence**: Maps stay "live" until their time expires, then check if they're live again
@@ -161,7 +160,6 @@ kackychecker/
 ├── schedule_parser.py      # HTML parsing (BeautifulSoup)
 ├── settings_manager.py     # Settings loading/saving
 ├── map_status_manager.py   # Map status persistence
-├── watchlist_manager.py    # Watchlist I/O
 ├── path_utils.py           # Path utilities (EXE vs dev mode)
 ├── playwright_installer.py # Playwright browser installation
 ├── config.py               # Configuration and logging setup
@@ -211,8 +209,7 @@ pytest tests/
 When running in development mode, configuration files are created in the project directory:
 
 - `settings.json` - Application settings
-- `watchlist.txt` - Map watchlist
-- `map_status.json` - Tracking state
+- `map_status.json` - Tracks watched maps, finished maps, and server uptimes
 - `log.txt` - Application logs
 
 ### Internal Settings
@@ -221,7 +218,7 @@ The following settings are internal and not shown in the GUI (have sensible defa
 
 - `REQUEST_TIMEOUT_SECONDS`: Network timeout (default: 10 seconds)
 - `USER_AGENT`: HTTP user agent string
-- `WATCHLIST_REFRESH_SECONDS`: How often to check for watchlist changes (default: 20 seconds)
+- `WATCHLIST_REFRESH_SECONDS`: How often to check for map status file changes (default: 20 seconds)
 - `LIVE_DURATION_SECONDS`: Fallback duration when time not available from website (default: 600 seconds)
 
 These can be modified in `settings.json` if needed for debugging, but are not exposed in the GUI.
@@ -266,7 +263,7 @@ These can be modified in `settings.json` if needed for debugging, but are not ex
 - Verify Python is in your system PATH: `python --version`
 
 **Maps not showing:**
-- Check that maps are in your watchlist (left pane in GUI)
+- Check that maps are being tracked (checkboxes in left pane in GUI)
 - Verify the website structure hasn't changed (check `log.txt`)
 - Enable DEBUG log level in settings to see detailed logs
 
@@ -303,8 +300,7 @@ The application requires Playwright browsers to function:
 All user data files are stored in the same directory as the EXE:
 
 - `settings.json`: User settings (notifications, log level)
-- `watchlist.txt`: List of tracked maps
-- `map_status.json`: Tracking state (which maps are tracked/finished)
+- `map_status.json`: Tracks watched maps, finished maps, and server uptimes
 - `log.txt`: Application logs (reset on each startup)
 
 ## License
