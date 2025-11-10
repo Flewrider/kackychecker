@@ -25,8 +25,10 @@ THIS HAS BEEN MADE WITH AI.
 
 2. **First Run Setup**
    - On first launch, the app will prompt you to install Playwright browsers (required)
+   - **Python 3.11+ must be installed** on your system for browser installation
    - Click "Yes" to install (downloads ~100-200MB, takes a few minutes)
    - The app cannot function without Playwright browsers
+   - After browsers are installed, the EXE works independently (Python only needed for initial setup)
 
 3. **Configuration Files**
    - `settings.json` - Application settings (created automatically)
@@ -39,8 +41,11 @@ THIS HAS BEEN MADE WITH AI.
 ### Requirements
 
 - **Windows 10 or later**
+- **Python 3.11 or later** (required for browser installation on first run)
+  - The EXE bundles Python runtime, but system Python is needed to install Playwright browsers
+  - After browsers are installed, the EXE works independently
 - **Playwright browsers** (installed automatically on first run)
-- **No Python installation required** (EXE includes everything)
+  - Requires Python to be installed on first run only
 
 ## Usage
 
@@ -255,8 +260,10 @@ These can be modified in `settings.json` if needed for debugging, but are not ex
 
 **Playwright browsers not found:**
 - The app will prompt to install on first run
+- **Ensure Python 3.11+ is installed** on your system (required for browser installation)
 - If installation fails, try running manually: `python -m playwright install chromium`
 - Check that you have internet connection (browsers are downloaded)
+- Verify Python is in your system PATH: `python --version`
 
 **Maps not showing:**
 - Check that maps are in your watchlist (left pane in GUI)

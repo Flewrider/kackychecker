@@ -131,9 +131,12 @@ jobs:
           
           **Installation:**
           1. Download and extract `KackyWatcher.zip`
-          2. Run `KackyWatcher.exe`
-          3. The app will prompt you to install Playwright browsers on first run (required, ~100-200MB download)
-          4. Files (`settings.json`, `watchlist.txt`, `map_status.json`) will be created automatically on first run
+          2. **Ensure Python 3.11+ is installed** on your system (required for browser installation)
+          3. Run `KackyWatcher.exe`
+          4. The app will prompt you to install Playwright browsers on first run (required, ~100-200MB download)
+          5. Files (`settings.json`, `watchlist.txt`, `map_status.json`) will be created automatically on first run
+          
+          **Note:** Python is only needed for the initial browser installation. After browsers are installed, the EXE works independently.
         draft: false
         prerelease: false
       env:
