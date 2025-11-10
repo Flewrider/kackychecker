@@ -39,7 +39,6 @@ a = Analysis(
         'config',
         'settings_manager',
         'map_status_manager',
-        'watchlist_manager',
         'watcher_core',
         'watcher_state',
         'schedule_fetcher',

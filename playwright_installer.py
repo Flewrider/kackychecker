@@ -170,6 +170,404 @@ def _create_browser_version_symlink(expected_version: str) -> bool:
         return False
 
 
+def _compare_versions(version1: str, version2: str) -> int:
+    """
+    Compare two version strings.
+    
+    Args:
+        version1: First version string (e.g., "1.40.0")
+        version2: Second version string (e.g., "1.55.0")
+        
+    Returns:
+        -1 if version1 < version2
+         0 if version1 == version2
+         1 if version1 > version2
+    """
+    try:
+        # Parse version strings (e.g., "1.40.0" -> [1, 40, 0])
+        def parse_version(v: str) -> list[int]:
+            # Remove any non-numeric suffixes (e.g., "1.40.0a1" -> "1.40.0")
+            v_clean = v.split('+')[0].split('-')[0]  # Remove build metadata and pre-release
+            parts = v_clean.split('.')
+            return [int(p) for p in parts]
+        
+        v1_parts = parse_version(version1)
+        v2_parts = parse_version(version2)
+        
+        # Pad with zeros to make lengths equal
+        max_len = max(len(v1_parts), len(v2_parts))
+        v1_parts.extend([0] * (max_len - len(v1_parts)))
+        v2_parts.extend([0] * (max_len - len(v2_parts)))
+        
+        # Compare
+        for v1, v2 in zip(v1_parts, v2_parts):
+            if v1 < v2:
+                return -1
+            elif v1 > v2:
+                return 1
+        return 0
+    except Exception as e:
+        logging.debug(f"Error comparing versions '{version1}' and '{version2}': {e}")
+        # If parsing fails, assume versions are equal to avoid false positives
+        return 0
+
+
+def _is_version_older(version: str, min_version: str) -> bool:
+    """
+    Check if a version is older than a minimum required version.
+    
+    Args:
+        version: Version to check (e.g., "1.40.0")
+        min_version: Minimum required version (e.g., "1.50.0")
+        
+    Returns:
+        True if version is older than min_version, False otherwise
+    """
+    return _compare_versions(version, min_version) < 0
+
+
+def _get_bundled_playwright_version() -> Optional[str]:
+    """
+    Get the version of Playwright bundled in the EXE.
+    
+    Returns:
+        Playwright version string (e.g., "1.40.0") or None if not available
+    """
+    try:
+        import playwright
+        version = playwright.__version__
+        logging.debug(f"Bundled Playwright version: {version}")
+        return version
+    except Exception as e:
+        logging.debug(f"Could not get bundled Playwright version: {e}")
+        return None
+
+
+def _check_python_version_compatibility(python_cmd: str) -> tuple[bool, Optional[str]]:
+    """
+    Check if Python version is compatible with Playwright.
+    
+    Playwright requires Python 3.8 or higher.
+    
+    Args:
+        python_cmd: Path to Python executable
+        
+    Returns:
+        Tuple of (is_compatible: bool, error_message: Optional[str])
+    """
+    try:
+        result = subprocess.run(
+            [python_cmd, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False
+        )
+        
+        if result.returncode != 0:
+            return False, f"Could not determine Python version: {result.stderr[:200]}"
+        
+        version_str = result.stdout.strip()
+        logging.debug(f"Python version: {version_str}")
+        
+        # Extract version number (e.g., "Python 3.11.0" -> "3.11.0")
+        import re
+        version_match = re.search(r'(\d+)\.(\d+)', version_str)
+        if not version_match:
+            return False, f"Could not parse Python version: {version_str}"
+        
+        major = int(version_match.group(1))
+        minor = int(version_match.group(2))
+        
+        # Playwright requires Python 3.8+
+        if major < 3 or (major == 3 and minor < 8):
+            return False, f"Python {major}.{minor} is not supported. Playwright requires Python 3.8 or higher."
+        
+        logging.debug(f"Python version {major}.{minor} is compatible with Playwright")
+        return True, None
+        
+    except Exception as e:
+        logging.debug(f"Error checking Python version: {e}")
+        return False, f"Error checking Python version: {str(e)}"
+
+
+def _check_pip_available(python_cmd: str) -> tuple[bool, Optional[str]]:
+    """
+    Check if pip is available in the Python installation.
+    
+    Args:
+        python_cmd: Path to Python executable
+        
+    Returns:
+        Tuple of (is_available: bool, error_message: Optional[str])
+    """
+    try:
+        result = subprocess.run(
+            [python_cmd, "-m", "pip", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False
+        )
+        
+        if result.returncode != 0:
+            error_msg = result.stderr or result.stdout or "Unknown error"
+            return False, f"pip is not available: {error_msg[:200]}"
+        
+        pip_version = result.stdout.strip()
+        logging.debug(f"pip is available: {pip_version}")
+        return True, None
+        
+    except Exception as e:
+        logging.debug(f"Error checking pip availability: {e}")
+        return False, f"Error checking pip: {str(e)}"
+
+
+def _test_playwright_functionality(python_cmd: str) -> tuple[bool, Optional[str]]:
+    """
+    Test if Playwright can be imported and used (functional test).
+    
+    Args:
+        python_cmd: Path to Python executable
+        
+    Returns:
+        Tuple of (is_functional: bool, error_message: Optional[str])
+    """
+    try:
+        # Test if Playwright can be imported (simple import test)
+        # Note: We don't actually launch a browser here, just verify the module works
+        result = subprocess.run(
+            [python_cmd, "-c", "from playwright.sync_api import sync_playwright; print('OK')"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False
+        )
+        
+        if result.returncode != 0:
+            error_msg = result.stderr or result.stdout or "Unknown error"
+            logging.debug(f"Playwright functionality test failed: {error_msg[:300]}")
+            return False, f"Playwright import test failed: {error_msg[:200]}"
+        
+        if "OK" not in result.stdout:
+            logging.debug("Playwright import test did not produce expected output")
+            return False, "Playwright import test failed - unexpected output"
+        
+        logging.debug("Playwright functionality test passed")
+        return True, None
+        
+    except subprocess.TimeoutExpired:
+        return False, "Playwright functionality test timed out"
+    except Exception as e:
+        logging.debug(f"Error testing Playwright functionality: {e}")
+        return False, f"Error testing Playwright: {str(e)}"
+
+
+def _set_standard_browsers_path() -> None:
+    """
+    Set PLAYWRIGHT_BROWSERS_PATH to the standard location before installation.
+    This ensures browsers are installed to a persistent location, not a temp directory.
+    
+    This MUST be called BEFORE any Playwright installation operations in EXE mode.
+    """
+    # Set to standard Windows location: AppData\Local\ms-playwright
+    appdata = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA")
+    if appdata:
+        standard_path = os.path.join(appdata, "ms-playwright")
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = standard_path
+        logging.debug(f"Set PLAYWRIGHT_BROWSERS_PATH to standard location: {standard_path}")
+        # Create directory if it doesn't exist
+        from pathlib import Path
+        Path(standard_path).mkdir(parents=True, exist_ok=True)
+        logging.debug(f"Ensured standard browsers directory exists: {standard_path}")
+    else:
+        logging.warning("Could not find AppData directory to set standard browsers path")
+
+
+def _ensure_playwright_installed_in_system_python(python_cmd: str, min_version: Optional[str] = None) -> tuple[bool, Optional[str]]:
+    """
+    Check if Playwright is installed in system Python, and install/upgrade it if needed.
+    Also verifies functionality and handles edge cases.
+    
+    Args:
+        python_cmd: Path to Python executable (python.exe or pythonw.exe)
+        min_version: Minimum required Playwright version (e.g., "1.40.0"). If None, uses bundled version.
+        
+    Returns:
+        Tuple of (success: bool, error_message: Optional[str])
+        Returns (True, None) if Playwright is available and functional, (False, error_msg) otherwise
+    """
+    logging.debug(f"Checking if Playwright is installed in system Python: {python_cmd}")
+    
+    # Check Python version compatibility first
+    python_compatible, python_error = _check_python_version_compatibility(python_cmd)
+    if not python_compatible:
+        logging.error(f"Python version incompatible: {python_error}")
+        return False, python_error
+    
+    # Check if pip is available
+    pip_available, pip_error = _check_pip_available(python_cmd)
+    if not pip_available:
+        logging.error(f"pip not available: {pip_error}")
+        return False, f"pip is not available in Python installation. {pip_error}"
+    
+    # Get minimum version from bundled Playwright if not provided
+    if min_version is None:
+        min_version = _get_bundled_playwright_version()
+        if min_version:
+            logging.debug(f"Using bundled Playwright version as minimum: {min_version}")
+    
+    # First, check if Playwright is already installed
+    playwright_installed = False
+    playwright_version = None
+    try:
+        result = subprocess.run(
+            [python_cmd, "-m", "playwright", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False
+        )
+        
+        if result.returncode == 0:
+            playwright_version = result.stdout.strip()
+            logging.info(f"Playwright is already installed in system Python: {playwright_version}")
+            playwright_installed = True
+        else:
+            # Playwright module not found or not working
+            logging.debug(f"Playwright not found in system Python (return code: {result.returncode})")
+            if result.stderr:
+                logging.debug(f"Error output: {result.stderr[:200]}")
+    except Exception as e:
+        logging.debug(f"Error checking Playwright installation: {e}")
+        # Continue to installation attempt
+    
+    # If Playwright is installed, check if it needs upgrading
+    if playwright_installed and playwright_version and min_version:
+        if _is_version_older(playwright_version, min_version):
+            logging.warning(f"Playwright version {playwright_version} is older than required {min_version}")
+            logging.info("Upgrading Playwright to latest version...")
+            try:
+                upgrade_result = subprocess.run(
+                    [python_cmd, "-m", "pip", "install", "--upgrade", "playwright"],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,  # 5 minute timeout
+                    check=False
+                )
+                
+                if upgrade_result.returncode != 0:
+                    upgrade_error = upgrade_result.stderr or upgrade_result.stdout or "Unknown error"
+                    logging.warning(f"Failed to upgrade Playwright: {upgrade_error[:300]}")
+                    # Continue anyway - old version might still work, but log warning
+                    logging.warning(f"Using existing Playwright version {playwright_version} (upgrade failed)")
+                else:
+                    logging.info("Playwright upgraded successfully")
+                    # Verify new version
+                    verify_result = subprocess.run(
+                        [python_cmd, "-m", "playwright", "--version"],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=False
+                    )
+                    if verify_result.returncode == 0:
+                        new_version = verify_result.stdout.strip()
+                        logging.info(f"Playwright upgraded to: {new_version}")
+                        playwright_version = new_version
+                    else:
+                        logging.warning("Could not verify Playwright version after upgrade")
+            except subprocess.TimeoutExpired:
+                logging.warning("Playwright upgrade timed out - using existing version")
+            except Exception as e:
+                logging.warning(f"Error upgrading Playwright: {e} - using existing version")
+        
+        # Test Playwright functionality
+        functional, func_error = _test_playwright_functionality(python_cmd)
+        if not functional:
+            logging.warning(f"Playwright installed but functionality test failed: {func_error}")
+            logging.info("Attempting to reinstall Playwright...")
+            # Playwright might be corrupted - try reinstalling
+            playwright_installed = False  # Force reinstall
+        else:
+            logging.debug("Playwright functionality test passed")
+            return True, None
+    
+    # Playwright is not installed or needs reinstalling - install/upgrade it
+    if not playwright_installed:
+        logging.info("Playwright not found in system Python. Installing Playwright package...")
+    else:
+        logging.info("Reinstalling Playwright package (functionality test failed)...")
+    
+    try:
+        # Install/upgrade Playwright using pip
+        # Use --upgrade to ensure we get the latest version, or reinstall if corrupted
+        install_cmd = [python_cmd, "-m", "pip", "install", "--upgrade", "playwright"]
+        if not playwright_installed:
+            logging.info(f"Installing Playwright package via: {' '.join(install_cmd)}")
+        else:
+            logging.info(f"Reinstalling Playwright package via: {' '.join(install_cmd)}")
+        
+        result = subprocess.run(
+            install_cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5 minute timeout for pip install
+            check=False
+        )
+        
+        if result.returncode != 0:
+            error_msg = result.stderr or result.stdout or "Unknown error"
+            logging.error(f"Failed to install Playwright package: {error_msg[:500]}")
+            
+            # Check for common errors
+            error_lower = error_msg.lower()
+            if "permission" in error_lower or "access denied" in error_lower:
+                return False, "Permission denied. Try running as administrator or install Playwright manually: python -m pip install playwright"
+            elif "network" in error_lower or "timeout" in error_lower or "connection" in error_lower:
+                return False, "Network error. Check your internet connection and try again."
+            elif "disk" in error_lower or "space" in error_lower:
+                return False, "Insufficient disk space. Free up space and try again."
+            
+            return False, f"Failed to install Playwright package: {error_msg[:200]}"
+        
+        logging.info("Playwright package installed successfully in system Python")
+        logging.debug(f"Installation output: {result.stdout[:500]}")
+        
+        # Verify installation
+        verify_result = subprocess.run(
+            [python_cmd, "-m", "playwright", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False
+        )
+        
+        if verify_result.returncode != 0:
+            verify_error = verify_result.stderr or verify_result.stdout or "Unknown error"
+            logging.error(f"Playwright installation completed but version check failed: {verify_error[:200]}")
+            return False, "Playwright installation completed but version verification failed"
+        
+        installed_version = verify_result.stdout.strip()
+        logging.info(f"Playwright installation verified: {installed_version}")
+        
+        # Test functionality
+        functional, func_error = _test_playwright_functionality(python_cmd)
+        if not functional:
+            logging.error(f"Playwright installed but functionality test failed: {func_error}")
+            return False, f"Playwright installed but not functional: {func_error}"
+        
+        logging.debug("Playwright installation and functionality verified")
+        return True, None
+            
+    except subprocess.TimeoutExpired:
+        logging.error("Playwright package installation timed out after 5 minutes")
+        return False, "Playwright package installation timed out. Please check your internet connection and try again."
+    except Exception as e:
+        logging.error(f"Error installing Playwright package: {e}", exc_info=True)
+        return False, f"Error installing Playwright package: {str(e)}"
+
+
 def _find_and_set_installed_browser_path() -> Optional[str]:
     """
     Find where Playwright browsers are actually installed and set PLAYWRIGHT_BROWSERS_PATH.
@@ -320,32 +718,58 @@ def install_browsers() -> tuple[bool, Optional[str]]:
         logging.debug(f"sys.executable: {sys.executable}")
         
         if is_exe:
-            # In EXE mode, try to use bundled Playwright's installation first
-            # This ensures we install the browser version that matches the bundled Playwright
-            logging.debug("Attempting EXE mode installation...")
+            # In EXE mode, set standard browsers path BEFORE installation
+            # This ensures browsers are installed to a persistent location, not temp directory
+            _set_standard_browsers_path()
+            logging.debug(f"After setting standard path, PLAYWRIGHT_BROWSERS_PATH: {os.getenv('PLAYWRIGHT_BROWSERS_PATH')}")
             
-            # First, try using the bundled Playwright's CLI to install browsers
-            # This should install the version that matches the bundled Playwright
-            bundled_cli_success = False
+            # OPTION A: Try programmatic installation using bundled Playwright's internal APIs (first attempt)
+            # This attempts to use Playwright's installation mechanism directly without subprocess
+            programmatic_success = False
+            logging.info("Attempting programmatic browser installation (Option A: bundled Playwright)...")
             try:
-                from playwright._impl._cli import install as cli_install
-                import sys as sys_module
-                original_argv = sys_module.argv[:]
-                try:
-                    sys_module.argv = ["playwright", "install", "chromium"]
-                    logging.debug("Installing browsers via bundled Playwright CLI (ensures correct version)...")
-                    cli_install()
-                    logging.debug("Playwright browsers installed via bundled CLI")
-                    bundled_cli_success = True
-                except Exception as cli_err:
-                    logging.debug(f"Bundled CLI installation failed: {cli_err}, trying system Python...")
-                finally:
-                    sys_module.argv = original_argv
-            except ImportError:
-                logging.debug("Bundled Playwright CLI not available, using system Python...")
+                # Try to use Playwright's internal driver installation mechanism
+                # This is the most direct way to install browsers programmatically
+                from playwright._impl._driver import install_drivers
+                logging.info("Installing Chromium browser via Playwright's internal driver API...")
+                install_drivers()
+                logging.info("Chromium browser installed successfully via programmatic API")
+                programmatic_success = True
+                    
+            except ImportError as import_err:
+                logging.debug(f"Playwright driver API not available: {import_err}")
+                # This is expected in some cases - continue to fallback
+            except Exception as prog_err:
+                logging.warning(f"Programmatic installation failed: {prog_err}")
+                logging.debug(f"Programmatic installation error details: {prog_err}", exc_info=True)
+                # Continue to fallback methods
             
-            # If bundled CLI failed or is not available, detect expected version and install it
-            if not bundled_cli_success:
+            # OPTION B: If programmatic installation failed, try bundled CLI
+            if not programmatic_success:
+                logging.info("Programmatic installation failed, trying bundled Playwright CLI...")
+                bundled_cli_success = False
+                try:
+                    from playwright._impl._cli import install as cli_install
+                    import sys as sys_module
+                    original_argv = sys_module.argv[:]
+                    try:
+                        sys_module.argv = ["playwright", "install", "chromium"]
+                        logging.debug("Installing browsers via bundled Playwright CLI...")
+                        cli_install()
+                        logging.info("Playwright browsers installed via bundled CLI")
+                        bundled_cli_success = True
+                    except Exception as cli_err:
+                        logging.warning(f"Bundled CLI installation failed: {cli_err}")
+                        logging.debug(f"Bundled CLI error details: {cli_err}", exc_info=True)
+                    finally:
+                        sys_module.argv = original_argv
+                except ImportError:
+                    logging.debug("Bundled Playwright CLI not available (ImportError)")
+            
+            # OPTION C: If both programmatic and CLI failed, use system Python (with Playwright installation)
+            if not programmatic_success and not bundled_cli_success:
+                logging.info("Both programmatic and CLI methods failed, falling back to system Python...")
+                
                 # First, check what version the bundled Playwright expects
                 expected_version = None
                 try:
@@ -357,7 +781,7 @@ def install_browsers() -> tuple[bool, Optional[str]]:
                             version_match = re.search(r'chromium-(\d+)', browser_path)
                             if version_match:
                                 expected_version = version_match.group(1)
-                                logging.debug(f"Bundled Playwright expects chromium-{expected_version}")
+                                logging.info(f"Bundled Playwright expects chromium-{expected_version}")
                 except Exception as e:
                     logging.debug(f"Could not determine expected version: {e}")
                 
@@ -389,25 +813,47 @@ def install_browsers() -> tuple[bool, Optional[str]]:
                 
                 if not python_exe and not pythonw_exe:
                     logging.error("System Python not found. Cannot install Playwright browsers.")
-                    return False, "Python is required to install Playwright browsers. Please install Python and run: python -m playwright install chromium"
+                    return False, "Python is required to install Playwright browsers. Please install Python 3.8+ and try again."
                 
                 # Prefer pythonw to avoid console window, fall back to python if not available
                 python_cmd = pythonw_exe if pythonw_exe else python_exe
                 if pythonw_exe:
-                    logging.debug(f"Installing browsers via Pythonw (no console window) at {python_cmd}...")
+                    logging.info(f"Using Pythonw (no console window) at {python_cmd}...")
                 else:
                     logging.warning(f"Pythonw not found - using Python (console window will appear) at {python_cmd}...")
-                    logging.debug("Note: Install pythonw.exe to avoid console window during browser installation")
                 
+                # Get bundled Playwright version for compatibility checking
+                bundled_version = _get_bundled_playwright_version()
+                if bundled_version:
+                    logging.debug(f"Bundled Playwright version: {bundled_version}")
+                
+                # Ensure Playwright is installed in system Python (with version checking and upgrade)
+                logging.info("Ensuring Playwright is installed in system Python...")
+                playwright_available, playwright_error = _ensure_playwright_installed_in_system_python(
+                    python_cmd, 
+                    min_version=bundled_version
+                )
+                if not playwright_available:
+                    logging.error(f"Failed to ensure Playwright is installed: {playwright_error}")
+                    return False, f"Failed to install Playwright package: {playwright_error}. Please install manually: {python_cmd} -m pip install playwright"
+                
+                # Now install browsers using system Python's Playwright
+                logging.info("Installing Playwright browsers via system Python...")
                 try:
-                    # Install browsers using system Python's Playwright
-                    # This will install browsers to the standard location (AppData\Local\ms-playwright)
+                    # Ensure PLAYWRIGHT_BROWSERS_PATH is set for the subprocess
+                    # System Python's Playwright will respect this environment variable
+                    env = os.environ.copy()
+                    if os.getenv("PLAYWRIGHT_BROWSERS_PATH"):
+                        env["PLAYWRIGHT_BROWSERS_PATH"] = os.getenv("PLAYWRIGHT_BROWSERS_PATH")
+                        logging.debug(f"Setting PLAYWRIGHT_BROWSERS_PATH for subprocess: {env['PLAYWRIGHT_BROWSERS_PATH']}")
+                    
                     result = subprocess.run(
                         [python_cmd, "-m", "playwright", "install", "chromium"],
                         capture_output=True,
                         text=True,
                         timeout=600,  # 10 minute timeout (browser download can be slow)
-                        check=False
+                        check=False,
+                        env=env
                     )
                     
                     if result.returncode != 0:
@@ -416,7 +862,7 @@ def install_browsers() -> tuple[bool, Optional[str]]:
                         logging.error(f"Installation error: {error_msg[:1000]}")
                         return False, f"Installation failed: {error_msg[:200]}"
                     
-                    logging.debug("Playwright browsers installed successfully via Python subprocess")
+                    logging.info("Playwright browsers installed successfully via system Python")
                     logging.debug(f"Installation stdout: {result.stdout[:500]}")
                     if result.stderr:
                         logging.debug(f"Installation stderr: {result.stderr[:500]}")
@@ -428,7 +874,7 @@ def install_browsers() -> tuple[bool, Optional[str]]:
                         time.sleep(3)  # Wait for installation to complete
                         symlink_created = _create_browser_version_symlink(expected_version)
                         if symlink_created:
-                            logging.debug(f"Successfully created symlink/junction for chromium-{expected_version}")
+                            logging.info(f"Successfully created symlink/junction for chromium-{expected_version}")
                         else:
                             logging.warning(f"Failed to create symlink for chromium-{expected_version} - browser may not work correctly")
                         
@@ -471,7 +917,8 @@ def install_browsers() -> tuple[bool, Optional[str]]:
             # Check if we need to create a symlink for version mismatch
             # This handles the case where expected_version wasn't detected before installation
             # OR if we need to create a symlink after installation completes
-            if not bundled_cli_success:
+            # Only needed if we used system Python (not programmatic or bundled CLI)
+            if not programmatic_success and not bundled_cli_success:
                 try:
                     from playwright.sync_api import sync_playwright
                     with sync_playwright() as p:
@@ -561,6 +1008,7 @@ def install_browsers_with_progress(callback: Optional[callable] = None) -> tuple
     
     if callback:
         callback("Installing Playwright browsers (this may take a few minutes)...")
+        callback("Trying programmatic installation first, then system Python if needed...")
     
     success, error = install_browsers()
     
