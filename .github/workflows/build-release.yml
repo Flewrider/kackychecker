@@ -119,6 +119,85 @@ jobs:
         echo "version=$version" >> $env:GITHUB_OUTPUT
         echo "Created version: $version"
     
+    - name: Get previous tag for release notes
+      if: github.ref == 'refs/heads/main'
+      id: previous_tag
+      run: |
+        # Get the previous tag (the one before the current version)
+        $allTags = git tag -l "v*" --sort=-version:refname 2>$null
+        if ($allTags) {
+          $tags = ($allTags -split "`n" | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' } | Select-Object -First 2)
+          if ($tags.Count -ge 2) {
+            $previousTag = $tags[1]  # Second tag is the previous one
+            echo "previous_tag=$previousTag" >> $env:GITHUB_OUTPUT
+            echo "Previous tag: $previousTag"
+          } elseif ($tags.Count -eq 1) {
+            # Only one tag exists, use it as previous
+            $previousTag = $tags[0]
+            echo "previous_tag=$previousTag" >> $env:GITHUB_OUTPUT
+            echo "Previous tag: $previousTag"
+          } else {
+            echo "previous_tag=" >> $env:GITHUB_OUTPUT
+            echo "No valid tags found"
+          }
+        } else {
+          echo "previous_tag=" >> $env:GITHUB_OUTPUT
+          echo "No previous tag found"
+        }
+
+    - name: Generate release notes from commits
+      if: github.ref == 'refs/heads/main'
+      id: release_notes
+      run: |
+        $previousTag = "${{ steps.previous_tag.outputs.previous_tag }}"
+        $currentTag = "${{ steps.version.outputs.version }}"
+        
+        # Generate "What's Changed" section from commits
+        if ($previousTag) {
+          # Get commits between previous tag and HEAD (excluding merge commits)
+          $commits = git log --pretty=format:"- %s (%h)" --no-merges "$previousTag..HEAD" 2>$null
+          if ($commits -and $commits.Trim()) {
+            $changesSection = "## What's Changed`n`n$commits"
+          } else {
+            $changesSection = "## What's Changed`n`nNo commits found between $previousTag and $currentTag."
+          }
+        } else {
+          # No previous tag - get last 10 commits
+          $commits = git log --pretty=format:"- %s (%h)" --no-merges -10 2>$null
+          if ($commits -and $commits.Trim()) {
+            $changesSection = "## What's Changed`n`n$commits"
+          } else {
+            $changesSection = "## What's Changed`n`nSee commits for details."
+          }
+        }
+        
+        # Installation instructions
+        $installSection = @"
+
+---
+
+## Installation
+
+1. Download and extract `KackyWatcher.zip`
+2. **Ensure Python 3.11+ is installed** on your system (required for browser installation)
+3. Run `KackyWatcher.exe`
+4. The app will prompt you to install Playwright browsers on first run (required, ~100-200MB download)
+5. Files (`settings.json`, `map_status.json`) will be created automatically on first run
+
+**Note:** Python is only needed for the initial browser installation. After browsers are installed, the EXE works independently.
+"@
+        
+        # Combine sections (changes first, then installation)
+        $fullNotes = "$changesSection$installSection"
+        
+        # Output for GitHub Actions (multiline)
+        $delimiter = "RELEASE_NOTES_EOF"
+        echo "notes<<$delimiter" >> $env:GITHUB_OUTPUT
+        echo "$fullNotes" >> $env:GITHUB_OUTPUT
+        echo "$delimiter" >> $env:GITHUB_OUTPUT
+        
+        echo "Generated release notes with commits from git log"
+
     - name: Create Release (main branch only)
       if: github.ref == 'refs/heads/main'
       uses: softprops/action-gh-release@v1
@@ -126,16 +205,7 @@ jobs:
         files: dist/KackyWatcher.zip
         tag_name: ${{ steps.version.outputs.version }}
         name: Release ${{ steps.version.outputs.version }}
-        generate_release_notes: true
-        body: |
-          **Installation:**
-          1. Download and extract `KackyWatcher.zip`
-          2. **Ensure Python 3.11+ is installed** on your system (required for browser installation)
-          3. Run `KackyWatcher.exe`
-          4. The app will prompt you to install Playwright browsers on first run (required, ~100-200MB download)
-          5. Files (`settings.json`, `map_status.json`) will be created automatically on first run
-          
-          **Note:** Python is only needed for the initial browser installation. After browsers are installed, the EXE works independently.
+        body: ${{ steps.release_notes.outputs.notes }}
         draft: false
         prerelease: false
       env:
